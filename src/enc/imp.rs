@@ -8,7 +8,7 @@ use gstreamer_video::subclass::prelude::*;
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
 
-use crate::allocator::MppAllocator;
+use crate::allocator::{self, MppAllocator};
 use crate::mpp_ffi::{self as ffi, MppApiStruct};
 
 static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
@@ -37,10 +37,11 @@ struct EncoderState {
     mpp_ctx: ffi::MppCtx,
     mpi: *mut MppApiStruct,
     mpp_cfg: ffi::MppEncCfg,
-    mpp_frame: ffi::MppFrame,
     allocator: MppAllocator,
     hor_stride: u32,
     ver_stride: u32,
+    width: u32,
+    height: u32,
     codec: i32,
 }
 
@@ -49,23 +50,26 @@ unsafe impl Send for EncoderState {}
 impl Drop for EncoderState {
     fn drop(&mut self) {
         unsafe {
-            // Send EOS and drain
-            ffi::mpp_frame_set_eos(self.mpp_frame, 1);
-            ffi::mpp_frame_set_buffer(self.mpp_frame, std::ptr::null_mut());
-            if let Some(put_frame) = (*self.mpi).encode_put_frame {
-                let _ = put_frame(self.mpp_ctx, self.mpp_frame);
-            }
-            if let Some(get_packet) = (*self.mpi).encode_get_packet {
-                let mut pkt: ffi::MppPacket = std::ptr::null_mut();
-                for _ in 0..10 {
-                    let ret = get_packet(self.mpp_ctx, &mut pkt);
-                    if ret != ffi::MPP_OK || pkt.is_null() {
-                        break;
-                    }
-                    ffi::mpp_packet_deinit(&mut pkt);
+            // Send EOS frame to MPP and drain
+            let mut eos_frame: ffi::MppFrame = std::ptr::null_mut();
+            if ffi::mpp_frame_init(&mut eos_frame) == ffi::MPP_OK {
+                ffi::mpp_frame_set_eos(eos_frame, 1);
+                ffi::mpp_frame_set_buffer(eos_frame, std::ptr::null_mut());
+                if let Some(put_frame) = (*self.mpi).encode_put_frame {
+                    let _ = put_frame(self.mpp_ctx, eos_frame);
                 }
+                if let Some(get_packet) = (*self.mpi).encode_get_packet {
+                    let mut pkt: ffi::MppPacket = std::ptr::null_mut();
+                    for _ in 0..10 {
+                        let ret = get_packet(self.mpp_ctx, &mut pkt);
+                        if ret != ffi::MPP_OK || pkt.is_null() {
+                            break;
+                        }
+                        ffi::mpp_packet_deinit(&mut pkt);
+                    }
+                }
+                ffi::mpp_frame_deinit(&mut eos_frame);
             }
-            ffi::mpp_frame_deinit(&mut self.mpp_frame);
             ffi::mpp_enc_cfg_deinit(self.mpp_cfg);
             ffi::mpp_destroy(self.mpp_ctx);
         }
@@ -211,11 +215,9 @@ impl VideoEncoderImpl for MppH265Enc {
                 return Err(gst::error_msg!(gst::LibraryError::Init, ["mpp_create failed"]));
             }
 
-            // Set output timeout to 200ms (synchronous polling)
             if let Some(control) = (*mpi).control {
-                let mut timeout: i64 = ffi::MPP_POLL_NON_BLOCK as i64;
-                control(mpp_ctx, ffi::MPP_SET_INPUT_TIMEOUT, &mut timeout as *mut i64 as ffi::MppParam);
-                let mut timeout: i64 = 200;
+                // 1ms output timeout (vendor-matched)
+                let mut timeout: i64 = 1;
                 control(mpp_ctx, ffi::MPP_SET_OUTPUT_TIMEOUT, &mut timeout as *mut i64 as ffi::MppParam);
             }
 
@@ -231,9 +233,7 @@ impl VideoEncoderImpl for MppH265Enc {
                     return Err(gst::error_msg!(gst::LibraryError::Init, ["mpp_create failed (retry)"]));
                 }
                 if let Some(control) = (*mpi).control {
-                    let mut timeout: i64 = ffi::MPP_POLL_NON_BLOCK as i64;
-                    control(mpp_ctx, ffi::MPP_SET_INPUT_TIMEOUT, &mut timeout as *mut i64 as ffi::MppParam);
-                    let mut timeout: i64 = 200;
+                    let mut timeout: i64 = 1;
                     control(mpp_ctx, ffi::MPP_SET_OUTPUT_TIMEOUT, &mut timeout as *mut i64 as ffi::MppParam);
                 }
                 let avc_ret = ffi::mpp_init(mpp_ctx, ffi::MPP_CTX_ENC, ffi::MPP_VIDEO_CodingAVC);
@@ -245,15 +245,8 @@ impl VideoEncoderImpl for MppH265Enc {
                 gst::info!(CAT, imp = self, "MPP encoder: AVC (H.264)");
             }
 
-            let mut mpp_frame: ffi::MppFrame = std::ptr::null_mut();
-            if ffi::mpp_frame_init(&mut mpp_frame) != ffi::MPP_OK {
-                ffi::mpp_destroy(mpp_ctx);
-                return Err(gst::error_msg!(gst::LibraryError::Init, ["mpp_frame_init failed"]));
-            }
-
             let mut mpp_cfg: ffi::MppEncCfg = std::ptr::null_mut();
             if ffi::mpp_enc_cfg_init(&mut mpp_cfg) != ffi::MPP_OK {
-                ffi::mpp_frame_deinit(&mut mpp_frame);
                 ffi::mpp_destroy(mpp_ctx);
                 return Err(gst::error_msg!(gst::LibraryError::Init, ["mpp_enc_cfg_init failed"]));
             }
@@ -266,10 +259,11 @@ impl VideoEncoderImpl for MppH265Enc {
                 mpp_ctx,
                 mpi,
                 mpp_cfg,
-                mpp_frame,
                 allocator,
                 hor_stride: 0,
                 ver_stride: 0,
+                width: 0,
+                height: 0,
                 codec,
             });
         }
@@ -325,6 +319,8 @@ impl VideoEncoderImpl for MppH265Enc {
 
         enc.hor_stride = hor_stride;
         enc.ver_stride = ver_stride;
+        enc.width = width;
+        enc.height = height;
 
         unsafe {
             let cfg = enc.mpp_cfg;
@@ -368,12 +364,6 @@ impl VideoEncoderImpl for MppH265Enc {
                     return Err(gst::loggable_error!(CAT, "MPP_ENC_SET_CFG failed: {}", ret));
                 }
             }
-
-            ffi::mpp_frame_set_width(enc.mpp_frame, width);
-            ffi::mpp_frame_set_height(enc.mpp_frame, height);
-            ffi::mpp_frame_set_hor_stride(enc.mpp_frame, hor_stride);
-            ffi::mpp_frame_set_ver_stride(enc.mpp_frame, ver_stride);
-            ffi::mpp_frame_set_fmt(enc.mpp_frame, ffi::MPP_FMT_YUV420SP);
         }
 
         let codec_mime = if enc.codec == ffi::MPP_VIDEO_CodingHEVC { "video/x-h265" } else { "video/x-h264" };
@@ -398,42 +388,27 @@ impl VideoEncoderImpl for MppH265Enc {
 
     fn handle_frame(
         &self,
-        mut frame: gst_video::VideoCodecFrame,
+        frame: gst_video::VideoCodecFrame,
     ) -> Result<gst::FlowSuccess, gst::FlowError> {
-        gst::debug!(CAT, imp = self, "handle_frame: frame #{}", frame.system_frame_number());
         let mut enc_state = self.state.lock().unwrap();
         let enc = enc_state.as_mut().ok_or(gst::FlowError::NotNegotiated)?;
 
         let input_buffer = frame.input_buffer().ok_or(gst::FlowError::Error)?;
 
-        // Check for stride adaptation from DmaBuf/VideoMeta
-        if let Some(meta) = input_buffer.meta::<gst_video::VideoMeta>() {
-            let src_hstride = meta.stride()[0] as u32;
-            let src_vstride = if meta.n_planes() >= 2 {
-                (meta.offset()[1] as u32) / src_hstride.max(1)
-            } else {
-                enc.ver_stride
-            };
-            self.apply_strides(enc, src_hstride, src_vstride);
-        }
-
-        // Copy input to MppBuffer
+        // Copy NV12 input to MppBuffer
         let mpp_buf = self.copy_input_to_mpp(enc, input_buffer)?;
-
         let pts = frame.pts();
 
         unsafe {
-            // Build MppFrame for this input
+            // Create MppFrame and submit to encoder
             let mut mpp_frame: ffi::MppFrame = std::ptr::null_mut();
             if ffi::mpp_frame_init(&mut mpp_frame) != ffi::MPP_OK {
                 ffi::mpp_buffer_put(mpp_buf);
                 return Err(gst::FlowError::Error);
             }
 
-            let width = ffi::mpp_frame_get_width(enc.mpp_frame);
-            let height = ffi::mpp_frame_get_height(enc.mpp_frame);
-            ffi::mpp_frame_set_width(mpp_frame, width);
-            ffi::mpp_frame_set_height(mpp_frame, height);
+            ffi::mpp_frame_set_width(mpp_frame, enc.width);
+            ffi::mpp_frame_set_height(mpp_frame, enc.height);
             ffi::mpp_frame_set_hor_stride(mpp_frame, enc.hor_stride);
             ffi::mpp_frame_set_ver_stride(mpp_frame, enc.ver_stride);
             ffi::mpp_frame_set_fmt(mpp_frame, ffi::MPP_FMT_YUV420SP);
@@ -447,55 +422,94 @@ impl VideoEncoderImpl for MppH265Enc {
             let put_frame = (*enc.mpi).encode_put_frame.ok_or(gst::FlowError::Error)?;
             let ret = put_frame(enc.mpp_ctx, mpp_frame);
             ffi::mpp_frame_deinit(&mut mpp_frame);
+            ffi::mpp_buffer_put(mpp_buf);
 
             if ret != ffi::MPP_OK {
-                ffi::mpp_buffer_put(mpp_buf);
                 gst::error!(CAT, imp = self, "encode_put_frame failed: {}", ret);
                 return Err(gst::FlowError::Error);
             }
 
-            // Synchronously poll for encoded output
+            // Poll for encoded packet (synchronous, with 1ms timeout set in start())
             let get_packet = (*enc.mpi).encode_get_packet.ok_or(gst::FlowError::Error)?;
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut pkt: ffi::MppPacket = std::ptr::null_mut();
 
-            loop {
-                let mut pkt: ffi::MppPacket = std::ptr::null_mut();
+            // Retry loop — MPP may need a few ms to produce output
+            for _ in 0..200 {
                 get_packet(enc.mpp_ctx, &mut pkt);
-
                 if !pkt.is_null() {
-                    ffi::mpp_buffer_put(mpp_buf);
+                    break;
+                }
+            }
 
-                    let pkt_buf = ffi::mpp_packet_get_buffer(pkt);
-                    let pkt_len = ffi::mpp_packet_get_length(pkt);
+            if pkt.is_null() {
+                gst::warning!(CAT, imp = self, "encode_get_packet returned no output after retries");
+                // Drop the frame rather than stall the pipeline
+                drop(enc_state);
+                let obj = self.obj();
+                let oldest = gst_video::prelude::VideoEncoderExtManual::oldest_frame(&*obj);
+                if let Some(f) = oldest {
+                    let _ = gst_video::prelude::VideoEncoderExt::finish_frame(&*obj, f);
+                }
+                return Ok(gst::FlowSuccess::Ok);
+            }
 
-                    if !pkt_buf.is_null() && pkt_len > 0 {
+            let pkt_buf = ffi::mpp_packet_get_buffer(pkt);
+            let pkt_len = ffi::mpp_packet_get_length(pkt);
+
+            let output_buffer = if !pkt_buf.is_null() && pkt_len > 0 {
+                // Zero-copy output: wrap MppPacket buffer as DmaBuf GstMemory
+                let mem = allocator::wrap_mpp_buffer_as_dmabuf_memory(
+                    &enc.allocator,
+                    pkt_buf,
+                    pkt_len,
+                );
+                match mem {
+                    Some(mem) => {
+                        let mut buf = gst::Buffer::new();
+                        {
+                            let buf_mut = buf.get_mut().unwrap();
+                            buf_mut.append_memory(mem);
+                        }
+                        buf
+                    }
+                    None => {
+                        // Fallback: memcpy
                         let pkt_ptr = ffi::mpp_buffer_get_ptr(pkt_buf) as *const u8;
                         let src = std::slice::from_raw_parts(pkt_ptr, pkt_len);
-                        let mut output_buffer = gst::Buffer::with_size(pkt_len).unwrap();
+                        let mut buf = gst::Buffer::with_size(pkt_len).unwrap();
                         {
-                            let buf_mut = output_buffer.get_mut().unwrap();
+                            let buf_mut = buf.get_mut().unwrap();
                             let mut map = buf_mut.map_writable().unwrap();
                             map.as_mut_slice().copy_from_slice(src);
                         }
-                        ffi::mpp_packet_deinit(&mut pkt);
-
-                        drop(enc_state);
-                        frame.set_output_buffer(output_buffer);
-                        return gst_video::prelude::VideoEncoderExt::finish_frame(&*self.obj(), frame);
+                        buf
                     }
-
-                    ffi::mpp_packet_deinit(&mut pkt);
-                    drop(enc_state);
-                    return gst_video::prelude::VideoEncoderExt::finish_frame(&*self.obj(), frame);
                 }
-
-                if std::time::Instant::now() >= deadline {
-                    ffi::mpp_buffer_put(mpp_buf);
-                    gst::error!(CAT, imp = self, "encode timeout");
-                    return Err(gst::FlowError::Error);
+            } else {
+                ffi::mpp_packet_deinit(&mut pkt);
+                // No output data — finish frame without output
+                drop(enc_state);
+                let obj = self.obj();
+                let oldest = gst_video::prelude::VideoEncoderExtManual::oldest_frame(&*obj);
+                if let Some(f) = oldest {
+                    let _ = gst_video::prelude::VideoEncoderExt::finish_frame(&*obj, f);
                 }
+                return Ok(gst::FlowSuccess::Ok);
+            };
+
+            ffi::mpp_packet_deinit(&mut pkt);
+            drop(enc_state);
+
+            // Finish the frame with the encoded output
+            let obj = self.obj();
+            let oldest = gst_video::prelude::VideoEncoderExtManual::oldest_frame(&*obj);
+            if let Some(mut f) = oldest {
+                f.set_output_buffer(output_buffer);
+                gst_video::prelude::VideoEncoderExt::finish_frame(&*obj, f)?;
             }
         }
+
+        Ok(gst::FlowSuccess::Ok)
     }
 
     fn flush(&self) -> bool {
@@ -540,8 +554,8 @@ impl MppH265Enc {
             })?;
 
             let dst_ptr = ffi::mpp_buffer_get_ptr(mpp_buf) as *mut u8;
-            let width = ffi::mpp_frame_get_width(enc.mpp_frame) as usize;
-            let height = ffi::mpp_frame_get_height(enc.mpp_frame) as usize;
+            let width = enc.width as usize;
+            let height = enc.height as usize;
             let dst_stride = hor_stride as usize;
 
             if width == dst_stride {
@@ -577,32 +591,6 @@ impl MppH265Enc {
             }
 
             Ok(mpp_buf)
-        }
-    }
-
-    fn apply_strides(&self, enc: &mut EncoderState, hstride: u32, vstride: u32) {
-        if hstride == enc.hor_stride && vstride == enc.ver_stride {
-            return;
-        }
-
-        gst::info!(
-            CAT, imp = self,
-            "adapting strides: {}x{} -> {}x{}",
-            enc.hor_stride, enc.ver_stride, hstride, vstride
-        );
-
-        enc.hor_stride = hstride;
-        enc.ver_stride = vstride;
-
-        unsafe {
-            ffi::mpp_frame_set_hor_stride(enc.mpp_frame, hstride);
-            ffi::mpp_frame_set_ver_stride(enc.mpp_frame, vstride);
-            ffi::enc_cfg_set_s32(enc.mpp_cfg, "prep:hor_stride", hstride as i32);
-            ffi::enc_cfg_set_s32(enc.mpp_cfg, "prep:ver_stride", vstride as i32);
-
-            if let Some(control) = (*enc.mpi).control {
-                control(enc.mpp_ctx, ffi::MPP_ENC_SET_CFG, enc.mpp_cfg as ffi::MppParam);
-            }
         }
     }
 }
