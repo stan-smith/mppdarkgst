@@ -16,10 +16,6 @@ static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
     gst::DebugCategory::new("mppvideodec", gst::DebugColorFlags::empty(), Some("MPP Video Decoder"))
 });
 
-// ---------------------------------------------------------------------------
-// Decoder state (only present while running)
-// ---------------------------------------------------------------------------
-
 struct DecoderState {
     mpp_ctx: ffi::MppCtx,
     mpi: *mut MppApiStruct,
@@ -73,10 +69,6 @@ struct TaskShared {
 // Safety: TaskShared contains only primitive types + FlowError (Send+Sync).
 unsafe impl Send for TaskShared {}
 unsafe impl Sync for TaskShared {}
-
-// ---------------------------------------------------------------------------
-// GObject subclass
-// ---------------------------------------------------------------------------
 
 pub struct MppVideoDec {
     state: Mutex<Option<DecoderState>>,
@@ -278,7 +270,7 @@ impl VideoDecoderImpl for MppVideoDec {
                     std::ptr::null_mut(),
                 );
 
-                // 200ms output timeout (vendor-matched)
+                // 200ms output timeout
                 let mut timeout: i64 = 200;
                 control(
                     dec.mpp_ctx,
@@ -314,7 +306,7 @@ impl VideoDecoderImpl for MppVideoDec {
             &(*decoder_ptr).stream_lock as *const glib::ffi::GRecMutex as *mut glib::ffi::GRecMutex
         };
 
-        // Step 1: Start srcpad task if not already running
+        // Start srcpad task if not already running
         {
             let mut shared = self.shared.lock().unwrap();
             if !shared.task_started {
@@ -336,7 +328,7 @@ impl VideoDecoderImpl for MppVideoDec {
             }
         }
 
-        // Step 2: Copy input data and PTS, then drop frame to release stream lock ref count
+        // Copy input data and PTS, then drop frame to release stream lock ref
         let input_buffer = frame.input_buffer().ok_or(gst::FlowError::Error)?;
         let input_data: Vec<u8> = {
             let map = input_buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
@@ -365,8 +357,7 @@ impl VideoDecoderImpl for MppVideoDec {
                 ffi::mpp_packet_set_pts(mpkt, pts.nseconds() as i64);
             }
 
-            // Step 3: Submit packet to MPP, releasing stream lock during blocking send
-            // (matches vendor gstmppdec.c:1071-1081)
+            // Submit packet to MPP, releasing stream lock during blocking send
             let mut retries = 0;
             loop {
                 // Release stream lock so srcpad task can run
@@ -436,7 +427,7 @@ impl VideoDecoderImpl for MppVideoDec {
         }
         drop(guard);
 
-        // Clear flushing and allow restart
+        // Clear flushing state
         {
             let mut shared = self.shared.lock().unwrap();
             shared.flushing = false;
@@ -450,7 +441,6 @@ impl VideoDecoderImpl for MppVideoDec {
 
 impl MppVideoDec {
     /// Srcpad task loop — runs in a dedicated thread.
-    /// Matches vendor gstmppdec.c:gst_mpp_dec_loop().
     fn dec_loop(
         element: &super::MppVideoDec,
         shared: &Arc<Mutex<TaskShared>>,
@@ -465,8 +455,7 @@ impl MppVideoDec {
             }
         }
 
-        // Poll for a decoded frame (blocking with 200ms timeout, NO stream lock held).
-        // This is the key async benefit: we block here while handle_frame can submit packets.
+        // Poll for a decoded frame (no stream lock held)
         let mpp_frame = {
             let dec_state = imp.state.lock().unwrap();
             let Some(ref dec) = *dec_state else {
@@ -493,7 +482,7 @@ impl MppVideoDec {
             mpp_frame
         };
 
-        // Acquire stream lock (matching vendor GST_VIDEO_DECODER_STREAM_LOCK)
+        // Acquire stream lock
         let stream_lock = unsafe {
             let decoder_ptr: *const gst_video::ffi::GstVideoDecoder =
                 element.upcast_ref::<gst_video::VideoDecoder>().to_glib_none().0;

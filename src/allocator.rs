@@ -1,11 +1,6 @@
 #![allow(dead_code)]
-//! MppAllocator — manages MPP buffer groups for DmaBuf allocation and import.
-//!
-//! Wraps an `MppBufferGroup` (INTERNAL, DRM) for fresh allocations.
-//!
-//! This is a Rust-side helper, not a GObject subclass. The actual GstMemory
-//! objects are created using `gst_fd_allocator_alloc` from the GStreamer
-//! DmaBuf allocator via raw FFI.
+//! MppAllocator — wraps an MppBufferGroup (INTERNAL, DRM) and GstDmaBufAllocator
+//! for zero-copy DMA-BUF GstMemory allocation.
 
 use crate::mpp_ffi as ffi;
 
@@ -74,12 +69,8 @@ impl Drop for MppAllocator {
     }
 }
 
-// ---------------------------------------------------------------------------
-// MppBufGuard — ensures MppBuffer refcount is decremented when GstBuffer
-// is freed. Attached as qdata on GstMemory via gst_mini_object_set_qdata.
-// ---------------------------------------------------------------------------
-
 /// Guard that calls mpp_buffer_put on drop.
+/// Attached as qdata on GstMemory so the MppBuffer is released when GstMemory is freed.
 pub struct MppBufGuard {
     mpp_buf: ffi::MppBuffer,
 }

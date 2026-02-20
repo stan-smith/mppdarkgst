@@ -263,8 +263,7 @@ impl VideoEncoderImpl for MppH265Enc {
             }
 
             if let Some(control) = (*mpi).control {
-                // 1ms output timeout (vendor-matched)
-                let mut timeout: i64 = 1;
+                let mut timeout: i64 = 1; // 1ms output poll
                 control(mpp_ctx, ffi::MPP_SET_OUTPUT_TIMEOUT, &mut timeout as *mut i64 as ffi::MppParam);
             }
 
@@ -463,7 +462,7 @@ impl VideoEncoderImpl for MppH265Enc {
         &self,
         frame: gst_video::VideoCodecFrame,
     ) -> Result<gst::FlowSuccess, gst::FlowError> {
-        // Step 1: Copy input to MppBuffer and prepare MppFrame
+        // Copy input to MppBuffer and prepare MppFrame
         let (mpp_frame, mpp_buf) = {
             let mut enc_state = self.state.lock().unwrap();
             let enc = enc_state.as_mut().ok_or(gst::FlowError::NotNegotiated)?;
@@ -497,7 +496,7 @@ impl VideoEncoderImpl for MppH265Enc {
         // Drop frame to release stream lock ref count (from VideoCodecFrame)
         drop(frame);
 
-        // Step 2: Start srcpad task if not already running
+        // Start srcpad task if not already running
         {
             let mut shared = self.shared.0.lock().unwrap();
             if shared.flushing {
@@ -528,7 +527,7 @@ impl VideoEncoderImpl for MppH265Enc {
             }
         }
 
-        // Step 3: Back-pressure — if too many pending frames, release stream lock and wait
+        // Back-pressure: release stream lock and wait if too many pending frames
         let stream_lock = unsafe {
             let obj = self.obj();
             let encoder_ptr: *const gst_video::ffi::GstVideoEncoder =
@@ -567,7 +566,7 @@ impl VideoEncoderImpl for MppH265Enc {
             }
         }
 
-        // Step 4: Enqueue frame and signal the task
+        // Enqueue frame and signal the task
         let task_ret = {
             let mut shared = self.shared.0.lock().unwrap();
             shared.pending_frames += 1;
@@ -621,7 +620,7 @@ impl VideoEncoderImpl for MppH265Enc {
         }
         drop(guard);
 
-        // Clear flushing and allow restart
+        // Clear flushing state
         {
             let mut shared = self.shared.0.lock().unwrap();
             shared.flushing = false;
@@ -643,7 +642,6 @@ impl VideoEncoderImpl for MppH265Enc {
 
 impl MppH265Enc {
     /// Srcpad task loop — runs in a dedicated thread.
-    /// Matches vendor gstmppenc.c:gst_mpp_enc_loop().
     fn enc_loop(
         element: &super::MppH265Enc,
         shared: &Arc<(Mutex<TaskShared>, Condvar)>,
@@ -665,7 +663,7 @@ impl MppH265Enc {
             }
         }
 
-        // Acquire stream lock (matching vendor GST_VIDEO_ENCODER_STREAM_LOCK)
+        // Acquire stream lock
         let stream_lock = unsafe {
             let encoder_ptr: *const gst_video::ffi::GstVideoEncoder =
                 element.upcast_ref::<gst_video::VideoEncoder>().to_glib_none().0;
