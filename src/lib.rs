@@ -1,4 +1,5 @@
 mod mpp_ffi;
+mod allocator;
 
 mod enc;
 mod dec;

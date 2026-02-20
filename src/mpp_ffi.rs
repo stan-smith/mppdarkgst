@@ -184,6 +184,7 @@ pub const MPP_SET_OUTPUT_TIMEOUT: c_uint = 0x0020_0007;
 // Decoder commands (CMD_MODULE_CODEC | CMD_CTX_ID_DEC + offset)
 pub const MPP_DEC_SET_EXT_BUF_GROUP: c_uint = 0x0031_0002;
 pub const MPP_DEC_SET_INFO_CHANGE_READY: c_uint = 0x0031_0003;
+pub const MPP_DEC_SET_PARSER_SPLIT_MODE: c_uint = 0x0031_0005;
 pub const MPP_DEC_SET_PARSER_FAST_MODE: c_uint = 0x0031_0006;
 pub const MPP_DEC_SET_DISABLE_ERROR: c_uint = 0x0031_000b;
 pub const MPP_DEC_SET_OUTPUT_FORMAT: c_uint = 0x0031_000a;
@@ -329,9 +330,37 @@ extern "C" {
         caller: *const c_char,
     ) -> MppRet;
 
+    // ---- Buffer index (for identifying allocator ownership) ----
+    // Real symbols have _with_caller suffix (like other buffer ops)
+    pub fn mpp_buffer_set_index_with_caller(buf: MppBuffer, index: c_int, caller: *const c_char);
+    pub fn mpp_buffer_get_index_with_caller(buf: MppBuffer, caller: *const c_char) -> c_int;
+
     // ---- Meta operations ----
     pub fn mpp_meta_get_frame(meta: MppMeta, key: c_int, frame: *mut MppFrame) -> MppRet;
 }
+
+// ---------------------------------------------------------------------------
+// GStreamer DmaBuf allocator FFI (from libgstallocators-1.0)
+// ---------------------------------------------------------------------------
+
+pub type GstAllocator = c_void;
+pub type GstMemory = c_void;
+
+#[link(name = "gstallocators-1.0")]
+extern "C" {
+    pub fn gst_fd_allocator_alloc(
+        allocator: *mut GstAllocator,
+        fd: c_int,
+        size: usize,
+        flags: c_int,
+    ) -> *mut GstMemory;
+    pub fn gst_dmabuf_allocator_new() -> *mut GstAllocator;
+    pub fn gst_is_dmabuf_memory(mem: *const GstMemory) -> c_int;
+    pub fn gst_dmabuf_memory_get_fd(mem: *const GstMemory) -> c_int;
+}
+
+/// GstFdMemoryFlags - GST_FD_MEMORY_FLAG_KEEP_MAPPED = 4
+pub const GST_FD_MEMORY_FLAG_KEEP_MAPPED: c_int = 4;
 
 // ---------------------------------------------------------------------------
 // Safe helper to set an mpp_enc_cfg string key
@@ -399,6 +428,25 @@ pub unsafe fn mpp_buffer_get_ptr(buf: MppBuffer) -> *mut c_void {
 #[inline]
 pub unsafe fn mpp_buffer_get_size(buf: MppBuffer) -> usize {
     mpp_buffer_get_size_with_caller(buf, CALLER)
+}
+
+#[inline]
+pub unsafe fn mpp_buffer_set_index(buf: MppBuffer, index: c_int) {
+    mpp_buffer_set_index_with_caller(buf, index, CALLER)
+}
+
+#[inline]
+pub unsafe fn mpp_buffer_get_index(buf: MppBuffer) -> c_int {
+    mpp_buffer_get_index_with_caller(buf, CALLER)
+}
+
+#[inline]
+pub unsafe fn mpp_buffer_import(
+    group: MppBufferGroup,
+    info: *const MppBufferInfo,
+    buf: *mut MppBuffer,
+) -> MppRet {
+    mpp_buffer_import_with_tag(group, info, buf, TAG, CALLER)
 }
 
 // ---------------------------------------------------------------------------

@@ -20,24 +20,20 @@ static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
 struct DecoderState {
     mpp_ctx: ffi::MppCtx,
     mpi: *mut MppApiStruct,
-    /// Codec type determined from input caps
     codec: i32,
-    /// Whether we have negotiated output format after info_change
     negotiated: bool,
-    /// Output dimensions (set after info_change)
     width: u32,
     height: u32,
     hor_stride: u32,
     ver_stride: u32,
 }
 
-// Safety: MPP context is used behind our Mutex, one call at a time.
 unsafe impl Send for DecoderState {}
 
 impl Drop for DecoderState {
     fn drop(&mut self) {
         unsafe {
-            // Send EOS packet to flush
+            // Send EOS to MPP and drain remaining frames
             let mut eos_pkt: ffi::MppPacket = std::ptr::null_mut();
             if ffi::mpp_packet_init(&mut eos_pkt, std::ptr::null(), 0) == ffi::MPP_OK {
                 ffi::mpp_packet_set_eos(eos_pkt);
@@ -46,7 +42,6 @@ impl Drop for DecoderState {
                 }
                 ffi::mpp_packet_deinit(&mut eos_pkt);
             }
-            // Drain remaining frames
             if let Some(get_frame) = (*self.mpi).decode_get_frame {
                 let mut frame: ffi::MppFrame = std::ptr::null_mut();
                 for _ in 0..10 {
@@ -107,7 +102,6 @@ impl ElementImpl for MppVideoDec {
 
     fn pad_templates() -> &'static [gst::PadTemplate] {
         static PAD_TEMPLATES: Lazy<Vec<gst::PadTemplate>> = Lazy::new(|| {
-            // Sink: H.264 and H.265 byte-stream
             let sink_caps = gst::Caps::builder_full()
                 .structure(
                     gst::Structure::builder("video/x-h264")
@@ -129,7 +123,6 @@ impl ElementImpl for MppVideoDec {
             )
             .unwrap();
 
-            // Src: NV12 raw video
             let src_caps = gst_video::VideoCapsBuilder::new()
                 .format(gst_video::VideoFormat::Nv12)
                 .build();
@@ -206,9 +199,14 @@ impl VideoDecoderImpl for MppVideoDec {
         })?;
 
         unsafe {
-            // Enable fast parse mode (must be before mpp_init)
-            let mut fast_mode: i32 = 1;
             if let Some(control) = (*dec.mpi).control {
+                let mut split_mode: i32 = 1;
+                control(
+                    dec.mpp_ctx,
+                    ffi::MPP_DEC_SET_PARSER_SPLIT_MODE,
+                    &mut split_mode as *mut i32 as ffi::MppParam,
+                );
+                let mut fast_mode: i32 = 1;
                 control(
                     dec.mpp_ctx,
                     ffi::MPP_DEC_SET_PARSER_FAST_MODE,
@@ -220,18 +218,15 @@ impl VideoDecoderImpl for MppVideoDec {
                 return Err(gst::loggable_error!(CAT, "mpp_init decoder failed"));
             }
 
-            // Ignore decode errors (keep going)
             if let Some(control) = (*dec.mpi).control {
                 control(
                     dec.mpp_ctx,
                     ffi::MPP_DEC_SET_DISABLE_ERROR,
                     std::ptr::null_mut(),
                 );
-            }
 
-            // Set output timeout to 200ms
-            let mut timeout: i64 = 200;
-            if let Some(control) = (*dec.mpi).control {
+                // Set output timeout to 200ms
+                let mut timeout: i64 = 200;
                 control(
                     dec.mpp_ctx,
                     ffi::MPP_SET_OUTPUT_TIMEOUT,
@@ -248,209 +243,111 @@ impl VideoDecoderImpl for MppVideoDec {
 
     fn handle_frame(
         &self,
-        mut frame: gst_video::VideoCodecFrame,
+        frame: gst_video::VideoCodecFrame,
     ) -> Result<gst::FlowSuccess, gst::FlowError> {
-        let mut dec_state = self.state.lock().unwrap();
-        let dec = dec_state.as_mut().ok_or(gst::FlowError::NotNegotiated)?;
+        gst::debug!(CAT, imp = self, "handle_frame: frame #{}", frame.system_frame_number());
 
-        let input_buffer = frame.input_buffer().ok_or(gst::FlowError::Error)?;
-        let map = input_buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
-        let input_data = map.as_slice();
+        {
+            let mut dec_state = self.state.lock().unwrap();
+            let dec = dec_state.as_mut().ok_or(gst::FlowError::NotNegotiated)?;
 
-        unsafe {
-            // Create MppPacket from input data
-            let mut mpkt: ffi::MppPacket = std::ptr::null_mut();
-            if ffi::mpp_packet_init(&mut mpkt, input_data.as_ptr() as *const _, input_data.len())
-                != ffi::MPP_OK
-            {
-                gst::error!(CAT, imp = self, "mpp_packet_init failed");
-                return Err(gst::FlowError::Error);
-            }
+            let input_buffer = frame.input_buffer().ok_or(gst::FlowError::Error)?;
+            let map = input_buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
+            let input_data = map.as_slice();
 
-            // Set PTS on packet
-            if let Some(pts) = frame.pts() {
-                ffi::mpp_packet_set_pts(mpkt, pts.nseconds() as i64);
-            }
-
-            // Send packet to decoder with retry
-            let put_packet = (*dec.mpi)
-                .decode_put_packet
-                .ok_or(gst::FlowError::Error)?;
-
-            let mut retries = 0;
-            loop {
-                let ret = put_packet(dec.mpp_ctx, mpkt);
-                if ret == ffi::MPP_OK {
-                    break;
-                }
-                retries += 1;
-                if retries > 1000 {
-                    gst::error!(CAT, imp = self, "decode_put_packet timeout");
-                    ffi::mpp_packet_deinit(&mut mpkt);
+            unsafe {
+                let mut mpkt: ffi::MppPacket = std::ptr::null_mut();
+                if ffi::mpp_packet_init(&mut mpkt, input_data.as_ptr() as *const _, input_data.len())
+                    != ffi::MPP_OK
+                {
+                    gst::error!(CAT, imp = self, "mpp_packet_init failed");
                     return Err(gst::FlowError::Error);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
-            // Packet consumed by MPP on success — still need to deinit our handle
-            ffi::mpp_packet_deinit(&mut mpkt);
 
-            // Drop input map — no longer needed
+                if let Some(pts) = frame.pts() {
+                    ffi::mpp_packet_set_pts(mpkt, pts.nseconds() as i64);
+                }
+
+                let put_packet = (*dec.mpi)
+                    .decode_put_packet
+                    .ok_or(gst::FlowError::Error)?;
+
+                // Submit packet to MPP (retry if MPP queue is full)
+                let mut retries = 0;
+                loop {
+                    let ret = put_packet(dec.mpp_ctx, mpkt);
+                    if ret == ffi::MPP_OK {
+                        break;
+                    }
+                    retries += 1;
+                    if retries > 1000 {
+                        gst::error!(CAT, imp = self, "decode_put_packet timeout");
+                        ffi::mpp_packet_deinit(&mut mpkt);
+                        return Err(gst::FlowError::Error);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                ffi::mpp_packet_deinit(&mut mpkt);
+            }
+
+            // Drop input references before polling
             drop(map);
-
-            // Poll for decoded frame
-            let get_frame_fn = (*dec.mpi)
-                .decode_get_frame
-                .ok_or(gst::FlowError::Error)?;
-
-            let mut mpp_frame: ffi::MppFrame = std::ptr::null_mut();
-            let mut poll_retries = 0;
-            loop {
-                let ret = get_frame_fn(dec.mpp_ctx, &mut mpp_frame);
-                if ret == ffi::MPP_OK && !mpp_frame.is_null() {
-                    break;
-                }
-                poll_retries += 1;
-                if poll_retries > 500 {
-                    // No frame available — decoder may be buffering (B-frames etc.)
-                    gst::debug!(CAT, imp = self, "no decoded frame yet (buffering)");
-                    return Ok(gst::FlowSuccess::Ok);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-
-            // Check for info_change (resolution/format notification from MPP)
-            if ffi::mpp_frame_get_info_change(mpp_frame) != 0 {
-                let width = ffi::mpp_frame_get_width(mpp_frame);
-                let height = ffi::mpp_frame_get_height(mpp_frame);
-                let hor_stride = ffi::mpp_frame_get_hor_stride(mpp_frame);
-                let ver_stride = ffi::mpp_frame_get_ver_stride(mpp_frame);
-
-                gst::info!(
-                    CAT,
-                    imp = self,
-                    "info_change: {}x{} stride={}x{}",
-                    width,
-                    height,
-                    hor_stride,
-                    ver_stride
-                );
-
-                dec.width = width;
-                dec.height = height;
-                dec.hor_stride = hor_stride;
-                dec.ver_stride = ver_stride;
-
-                // Acknowledge the info change
-                if let Some(control) = (*dec.mpi).control {
-                    control(
-                        dec.mpp_ctx,
-                        ffi::MPP_DEC_SET_INFO_CHANGE_READY,
-                        std::ptr::null_mut(),
-                    );
-                }
-
-                dec.negotiated = true;
-                ffi::mpp_frame_deinit(&mut mpp_frame);
-
-                // Set output state — drop lock first
-                drop(dec_state);
-
-                let obj = self.obj();
-                let output_state =
-                    gst_video::prelude::VideoDecoderExtManual::set_output_state(
-                        &*obj,
-                        gst_video::VideoFormat::Nv12,
-                        width,
-                        height,
-                        None,
-                    )?;
-
-                gst_video::prelude::VideoDecoderExtManual::negotiate(&*obj, output_state)?;
-
-                return Ok(gst::FlowSuccess::Ok);
-            }
-
-            // Check for EOS
-            if ffi::mpp_frame_get_eos(mpp_frame) != 0 {
-                ffi::mpp_frame_deinit(&mut mpp_frame);
-                return Err(gst::FlowError::Eos);
-            }
-
-            // Check for errors/discard
-            if ffi::mpp_frame_get_errinfo(mpp_frame) != 0
-                || ffi::mpp_frame_get_discard(mpp_frame) != 0
-            {
-                gst::warning!(CAT, imp = self, "frame has error or discard flag");
-                ffi::mpp_frame_deinit(&mut mpp_frame);
-                return Ok(gst::FlowSuccess::Ok);
-            }
-
-            // Get the decoded buffer
-            let mpp_buf = ffi::mpp_frame_get_buffer(mpp_frame);
-            if mpp_buf.is_null() {
-                gst::warning!(CAT, imp = self, "decoded frame has no buffer");
-                ffi::mpp_frame_deinit(&mut mpp_frame);
-                return Ok(gst::FlowSuccess::Ok);
-            }
-
-            // If not yet negotiated, negotiate now from the first real frame
-            if !dec.negotiated {
-                let width = ffi::mpp_frame_get_width(mpp_frame);
-                let height = ffi::mpp_frame_get_height(mpp_frame);
-                let hor_stride = ffi::mpp_frame_get_hor_stride(mpp_frame);
-                let ver_stride = ffi::mpp_frame_get_ver_stride(mpp_frame);
-
-                dec.width = width;
-                dec.height = height;
-                dec.hor_stride = hor_stride;
-                dec.ver_stride = ver_stride;
-                dec.negotiated = true;
-
-                let output_buffer =
-                    copy_nv12_from_mpp(self, mpp_buf, width, height, hor_stride, ver_stride)?;
-                ffi::mpp_frame_deinit(&mut mpp_frame);
-
-                frame.set_output_buffer(output_buffer);
-                drop(dec_state);
-
-                let obj = self.obj();
-                let output_state =
-                    gst_video::prelude::VideoDecoderExtManual::set_output_state(
-                        &*obj,
-                        gst_video::VideoFormat::Nv12,
-                        width,
-                        height,
-                        None,
-                    )?;
-
-                gst_video::prelude::VideoDecoderExtManual::negotiate(&*obj, output_state)?;
-
-                return gst_video::prelude::VideoDecoderExt::finish_frame(&*obj, frame)
-                    .map(|_| gst::FlowSuccess::Ok);
-            }
-
-            // Normal path: copy NV12 from MPP buffer to GstBuffer
-            let width = dec.width;
-            let height = dec.height;
-            let hor_stride = dec.hor_stride;
-            let ver_stride = dec.ver_stride;
-
-            let output_buffer =
-                copy_nv12_from_mpp(self, mpp_buf, width, height, hor_stride, ver_stride)?;
-
-            ffi::mpp_frame_deinit(&mut mpp_frame);
-
-            frame.set_output_buffer(output_buffer);
         }
 
-        drop(dec_state);
+        // Drop frame reference — VideoDecoder holds it for us until finish_frame
+        drop(frame);
 
-        gst_video::prelude::VideoDecoderExt::finish_frame(&*self.obj(), frame)
+        // Poll for decoded output (may produce 0 or 1+ frames per input)
+        self.poll_decoded_frames()
+    }
+
+    fn finish(&self) -> Result<gst::FlowSuccess, gst::FlowError> {
+        gst::debug!(CAT, imp = self, "finish: draining decoder");
+
+        // Send EOS packet to MPP
+        {
+            let dec_state = self.state.lock().unwrap();
+            let dec = dec_state.as_ref().ok_or(gst::FlowError::Error)?;
+            unsafe {
+                let mut eos_pkt: ffi::MppPacket = std::ptr::null_mut();
+                if ffi::mpp_packet_init(&mut eos_pkt, std::ptr::null(), 0) == ffi::MPP_OK {
+                    ffi::mpp_packet_set_eos(eos_pkt);
+                    if let Some(put_packet) = (*dec.mpi).decode_put_packet {
+                        let _ = put_packet(dec.mpp_ctx, eos_pkt);
+                    }
+                    ffi::mpp_packet_deinit(&mut eos_pkt);
+                }
+            }
+        }
+
+        // Poll remaining decoded frames until EOS or timeout
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if std::time::Instant::now() >= deadline {
+                gst::warning!(CAT, imp = self, "finish: drain timeout");
+                break;
+            }
+
+            match self.try_get_one_frame() {
+                FrameResult::Frame(output_buffer) => {
+                    self.finish_one_frame(output_buffer);
+                }
+                FrameResult::Eos => break,
+                FrameResult::TryAgain => {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                FrameResult::Skip => continue,
+            }
+        }
+
+        gst::debug!(CAT, imp = self, "finish: drain complete");
+        Ok(gst::FlowSuccess::Ok)
     }
 
     fn flush(&self) -> bool {
         gst::debug!(CAT, imp = self, "flush");
-        if let Some(ref dec) = *self.state.lock().unwrap() {
+        let guard = self.state.lock().unwrap();
+        if let Some(ref dec) = *guard {
             unsafe {
                 if let Some(reset) = (*dec.mpi).reset {
                     reset(dec.mpp_ctx);
@@ -461,62 +358,218 @@ impl VideoDecoderImpl for MppVideoDec {
     }
 }
 
-/// Copy NV12 data from an MPP buffer into a new GstBuffer, handling stride differences.
-unsafe fn copy_nv12_from_mpp(
-    imp: &MppVideoDec,
-    mpp_buf: ffi::MppBuffer,
-    width: u32,
-    height: u32,
-    hor_stride: u32,
-    ver_stride: u32,
-) -> Result<gst::Buffer, gst::FlowError> {
-    let src_ptr = ffi::mpp_buffer_get_ptr(mpp_buf) as *const u8;
-    if src_ptr.is_null() {
-        gst::error!(CAT, imp = imp, "mpp_buffer_get_ptr returned null");
-        return Err(gst::FlowError::Error);
-    }
+enum FrameResult {
+    Frame(gst::Buffer),
+    Eos,
+    TryAgain,
+    Skip,
+}
 
-    let out_size = (width * height * 3 / 2) as usize;
-    let mut output_buffer = gst::Buffer::with_size(out_size).map_err(|_| gst::FlowError::Error)?;
+impl MppVideoDec {
+    /// Try to get one decoded frame from MPP. Lock is acquired and released within.
+    fn try_get_one_frame(&self) -> FrameResult {
+        let mut dec_state = self.state.lock().unwrap();
+        let dec = match dec_state.as_ref() {
+            Some(d) => d,
+            None => return FrameResult::Eos,
+        };
 
-    {
-        let buf_mut = output_buffer.get_mut().unwrap();
-        let mut map = buf_mut.map_writable().map_err(|_| gst::FlowError::Error)?;
-        let dst = map.as_mut_slice();
+        unsafe {
+            let get_frame_fn = match (*dec.mpi).decode_get_frame {
+                Some(f) => f,
+                None => return FrameResult::Eos,
+            };
 
-        let src_stride = hor_stride as usize;
-        let dst_stride = width as usize;
-        let h = height as usize;
+            let mut mpp_frame: ffi::MppFrame = std::ptr::null_mut();
+            let ret = get_frame_fn(dec.mpp_ctx, &mut mpp_frame);
 
-        if src_stride == dst_stride {
-            let copy_size = out_size.min(ffi::mpp_buffer_get_size(mpp_buf));
-            std::ptr::copy_nonoverlapping(src_ptr, dst.as_mut_ptr(), copy_size);
-        } else {
-            // Copy Y plane line by line
-            for y in 0..h {
-                let src_off = y * src_stride;
-                let dst_off = y * dst_stride;
-                std::ptr::copy_nonoverlapping(
-                    src_ptr.add(src_off),
-                    dst.as_mut_ptr().add(dst_off),
-                    dst_stride,
-                );
+            if ret != ffi::MPP_OK || mpp_frame.is_null() {
+                return FrameResult::TryAgain;
             }
-            // Copy UV plane line by line (half height for NV12)
-            let src_uv_base = (ver_stride as usize) * src_stride;
-            let dst_uv_base = h * dst_stride;
-            let uv_height = h / 2;
-            for y in 0..uv_height {
-                let src_off = src_uv_base + y * src_stride;
-                let dst_off = dst_uv_base + y * dst_stride;
-                std::ptr::copy_nonoverlapping(
-                    src_ptr.add(src_off),
-                    dst.as_mut_ptr().add(dst_off),
-                    dst_stride,
-                );
+
+            if ffi::mpp_frame_get_eos(mpp_frame) != 0 {
+                ffi::mpp_frame_deinit(&mut mpp_frame);
+                return FrameResult::Eos;
+            }
+
+            if ffi::mpp_frame_get_info_change(mpp_frame) != 0 {
+                self.handle_info_change_inline(&mut dec_state, mpp_frame);
+                return FrameResult::Skip;
+            }
+
+            if ffi::mpp_frame_get_errinfo(mpp_frame) != 0
+                || ffi::mpp_frame_get_discard(mpp_frame) != 0
+            {
+                gst::warning!(CAT, imp = self, "frame has error or discard flag");
+                ffi::mpp_frame_deinit(&mut mpp_frame);
+                return FrameResult::Skip;
+            }
+
+            let mpp_buf = ffi::mpp_frame_get_buffer(mpp_frame);
+            if mpp_buf.is_null() {
+                gst::warning!(CAT, imp = self, "decoded frame has no buffer");
+                ffi::mpp_frame_deinit(&mut mpp_frame);
+                return FrameResult::Skip;
+            }
+
+            let dec = dec_state.as_mut().unwrap();
+            if !dec.negotiated {
+                dec.width = ffi::mpp_frame_get_width(mpp_frame);
+                dec.height = ffi::mpp_frame_get_height(mpp_frame);
+                dec.hor_stride = ffi::mpp_frame_get_hor_stride(mpp_frame);
+                dec.ver_stride = ffi::mpp_frame_get_ver_stride(mpp_frame);
+                dec.negotiated = true;
+
+                let w = dec.width;
+                let h = dec.height;
+                self.negotiate_output(w, h);
+            }
+
+            let dec = dec_state.as_ref().unwrap();
+            let output_buffer = self.copy_decoded_frame(
+                mpp_buf, dec.hor_stride, dec.ver_stride, dec.width, dec.height,
+            );
+            ffi::mpp_frame_deinit(&mut mpp_frame);
+
+            match output_buffer {
+                Some(buf) => FrameResult::Frame(buf),
+                None => FrameResult::Skip,
             }
         }
     }
 
-    Ok(output_buffer)
+    /// Poll for decoded frames from MPP and push them downstream.
+    /// Called after each decode_put_packet.
+    fn poll_decoded_frames(&self) -> Result<gst::FlowSuccess, gst::FlowError> {
+        loop {
+            match self.try_get_one_frame() {
+                FrameResult::Frame(output_buffer) => {
+                    self.finish_one_frame(output_buffer);
+                }
+                FrameResult::TryAgain | FrameResult::Eos => break,
+                FrameResult::Skip => continue,
+            }
+        }
+        Ok(gst::FlowSuccess::Ok)
+    }
+
+    fn finish_one_frame(&self, output_buffer: gst::Buffer) {
+        let obj = self.obj();
+        let obj_ref = &*obj;
+        let frame = gst_video::prelude::VideoDecoderExtManual::oldest_frame(obj_ref);
+        if let Some(mut f) = frame {
+            f.set_output_buffer(output_buffer);
+            let _ = gst_video::prelude::VideoDecoderExt::finish_frame(obj_ref, f);
+        }
+    }
+
+    /// Handle info_change frame inline.
+    unsafe fn handle_info_change_inline(
+        &self,
+        dec_state: &mut std::sync::MutexGuard<'_, Option<DecoderState>>,
+        mpp_frame: ffi::MppFrame,
+    ) {
+        let width = ffi::mpp_frame_get_width(mpp_frame);
+        let height = ffi::mpp_frame_get_height(mpp_frame);
+        let hor_stride = ffi::mpp_frame_get_hor_stride(mpp_frame);
+        let ver_stride = ffi::mpp_frame_get_ver_stride(mpp_frame);
+
+        gst::info!(
+            CAT, imp = self,
+            "info_change: {}x{} stride={}x{}",
+            width, height, hor_stride, ver_stride
+        );
+
+        let dec = dec_state.as_mut().unwrap();
+        dec.width = width;
+        dec.height = height;
+        dec.hor_stride = hor_stride;
+        dec.ver_stride = ver_stride;
+        dec.negotiated = true;
+
+        // Acknowledge the info change
+        if let Some(control) = (*dec.mpi).control {
+            control(
+                dec.mpp_ctx,
+                ffi::MPP_DEC_SET_INFO_CHANGE_READY,
+                std::ptr::null_mut(),
+            );
+        }
+
+        ffi::mpp_frame_deinit(&mut { mpp_frame });
+
+        self.negotiate_output(width, height);
+    }
+
+    /// Copy decoded NV12 data from MppBuffer to a regular GstBuffer.
+    unsafe fn copy_decoded_frame(
+        &self,
+        mpp_buf: ffi::MppBuffer,
+        hor_stride: u32,
+        ver_stride: u32,
+        width: u32,
+        height: u32,
+    ) -> Option<gst::Buffer> {
+        let src_ptr = ffi::mpp_buffer_get_ptr(mpp_buf) as *const u8;
+        if src_ptr.is_null() {
+            return None;
+        }
+
+        let frame_size = (width * height * 3 / 2) as usize;
+        let mut buffer = gst::Buffer::with_size(frame_size).ok()?;
+        {
+            let buf_mut = buffer.get_mut().unwrap();
+            let mut map = buf_mut.map_writable().ok()?;
+            let dst = map.as_mut_slice();
+
+            let src_stride = hor_stride as usize;
+            let w = width as usize;
+            let h = height as usize;
+
+            if w == src_stride {
+                // No stride padding — direct copy
+                let copy_size = frame_size.min(ffi::mpp_buffer_get_size(mpp_buf));
+                std::ptr::copy_nonoverlapping(src_ptr, dst.as_mut_ptr(), copy_size);
+            } else {
+                // Copy Y plane line-by-line
+                for y in 0..h {
+                    let src_off = y * src_stride;
+                    let dst_off = y * w;
+                    std::ptr::copy_nonoverlapping(
+                        src_ptr.add(src_off),
+                        dst.as_mut_ptr().add(dst_off),
+                        w,
+                    );
+                }
+                // Copy UV plane line-by-line
+                let src_uv_base = (ver_stride as usize) * src_stride;
+                let dst_uv_base = h * w;
+                for y in 0..h / 2 {
+                    let src_off = src_uv_base + y * src_stride;
+                    let dst_off = dst_uv_base + y * w;
+                    std::ptr::copy_nonoverlapping(
+                        src_ptr.add(src_off),
+                        dst.as_mut_ptr().add(dst_off),
+                        w,
+                    );
+                }
+            }
+        }
+
+        Some(buffer)
+    }
+
+    fn negotiate_output(&self, width: u32, height: u32) {
+        let obj = self.obj();
+        let result = gst_video::prelude::VideoDecoderExtManual::set_output_state(
+            &*obj,
+            gst_video::VideoFormat::Nv12,
+            width,
+            height,
+            None,
+        );
+        if let Ok(output_state) = result {
+            let _ = gst_video::prelude::VideoDecoderExtManual::negotiate(&*obj, output_state);
+        }
+    }
 }
