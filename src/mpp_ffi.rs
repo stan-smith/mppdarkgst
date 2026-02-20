@@ -4,13 +4,15 @@
 //! Constants are derived from rk_mpi.h / rk_mpi_cmd.h / mpp_frame.h headers.
 //! Numeric values MUST be verified against the actual headers on the target.
 
+// Honestly, don't ask - Stan
+
 #![allow(non_camel_case_types, non_upper_case_globals, dead_code)]
 
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 
-// ---------------------------------------------------------------------------
+//  
 // Opaque handle types
-// ---------------------------------------------------------------------------
+//  
 
 pub type MppCtx = *mut c_void;
 pub type MppApi = *mut MppApiStruct;
@@ -25,9 +27,7 @@ pub type MppRet = c_int;
 
 pub const MPP_OK: MppRet = 0;
 
-// ---------------------------------------------------------------------------
 // MppApi — the function-pointer table returned by mpp_create()
-// ---------------------------------------------------------------------------
 // Layout must match the C struct exactly. Fields we don't use are still
 // declared to keep offsets correct.
 
@@ -60,9 +60,7 @@ pub struct MppApiStruct {
     pub reserved: [u32; 16],
 }
 
-// ---------------------------------------------------------------------------
 // MppBufferInfo — passed to mpp_buffer_import_with_tag
-// ---------------------------------------------------------------------------
 
 #[repr(C)]
 pub struct MppBufferInfo {
@@ -87,16 +85,13 @@ impl Default for MppBufferInfo {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Context types (MppCtxType)
-// ---------------------------------------------------------------------------
+
 
 pub const MPP_CTX_DEC: c_int = 0;
 pub const MPP_CTX_ENC: c_int = 1;
 
-// ---------------------------------------------------------------------------
 // Codec types (MppCodingType) — from rk_type.h
-// ---------------------------------------------------------------------------
 
 pub const MPP_VIDEO_CodingUnused: c_int = 0;
 pub const MPP_VIDEO_CodingAutoDetect: c_int = 1;
@@ -119,9 +114,9 @@ pub const MPP_VIDEO_CodingAVS: c_int = 17;
 pub const MPP_VIDEO_CodingAVS2: c_int = 18;
 pub const MPP_VIDEO_CodingAV1: c_int = 19;
 
-// ---------------------------------------------------------------------------
+//  
 // Frame format (MppFrameFormat) — from mpp_frame.h
-// ---------------------------------------------------------------------------
+//  
 
 pub const MPP_FMT_YUV420SP: c_int = 0; // NV12
 pub const MPP_FMT_YUV420SP_10BIT: c_int = 1;
@@ -155,9 +150,9 @@ pub const MPP_FMT_RGBA8888: c_int = 29;
 // Frame format mask (for stripping FBC flags)
 pub const MPP_FRAME_FMT_MASK: c_int = 0x000f_ffff;
 
-// ---------------------------------------------------------------------------
+//  
 // Buffer types (MppBufferType)
-// ---------------------------------------------------------------------------
+//  
 
 pub const MPP_BUFFER_TYPE_NORMAL: c_int = 0;
 pub const MPP_BUFFER_TYPE_ION: c_int = 1;
@@ -165,7 +160,7 @@ pub const MPP_BUFFER_TYPE_EXT_DMA: c_int = 2;
 pub const MPP_BUFFER_TYPE_DRM: c_int = 3;
 pub const MPP_BUFFER_TYPE_DMA_HEAP: c_int = 4;
 
-// ---------------------------------------------------------------------------
+//  
 // MpiCmd — control command IDs from rk_mpi_cmd.h
 //
 // Computed from the C enum using module/context bit masks:
@@ -175,7 +170,7 @@ pub const MPP_BUFFER_TYPE_DMA_HEAP: c_int = 4;
 //   CMD_CTX_ID_ENC   = 0x0002_0000
 //   CMD_ENC_CFG_MISC = 0x0000_8000
 // Values verified against Radxa rk_mpi_cmd.h headers.
-// ---------------------------------------------------------------------------
+//  
 
 // MPP timeout commands (CMD_MODULE_MPP + offset)
 pub const MPP_SET_INPUT_TIMEOUT: c_uint = 0x0020_0006;
@@ -196,43 +191,43 @@ pub const MPP_ENC_GET_CFG: c_uint = 0x0032_0002;
 pub const MPP_ENC_SET_HEADER_MODE: c_uint = 0x0032_8001;
 pub const MPP_ENC_SET_SEI_CFG: c_uint = 0x0032_000f;
 
-// ---------------------------------------------------------------------------
+//  
 // Encoder rate control modes (MppEncRcMode)
-// ---------------------------------------------------------------------------
+//  
 
 pub const MPP_ENC_RC_MODE_VBR: c_int = 0;
 pub const MPP_ENC_RC_MODE_CBR: c_int = 1;
 pub const MPP_ENC_RC_MODE_FIXQP: c_int = 2;
 pub const MPP_ENC_RC_MODE_AVBR: c_int = 3;
 
-// ---------------------------------------------------------------------------
+//  
 // Encoder header mode (MppEncHeaderMode)
-// ---------------------------------------------------------------------------
+//  
 
 pub const MPP_ENC_HEADER_MODE_DEFAULT: c_int = 0;
 pub const MPP_ENC_HEADER_MODE_EACH_IDR: c_int = 1;
 
-// ---------------------------------------------------------------------------
+//  
 // Encoder SEI mode (MppEncSeiMode)
-// ---------------------------------------------------------------------------
+//  
 
 pub const MPP_ENC_SEI_MODE_DISABLE: c_int = 0;
 
-// ---------------------------------------------------------------------------
+//  
 // Timeout values
-// ---------------------------------------------------------------------------
+//  
 
 pub const MPP_POLL_NON_BLOCK: c_int = 0; // MPP_POLL_NON_BLOCK in mpp_task.h
 
-// ---------------------------------------------------------------------------
+//  
 // Meta keys (for mpp_meta_get_frame etc.)
-// ---------------------------------------------------------------------------
+//  
 
 pub const KEY_INPUT_FRAME: c_int = 3; // From mpp_meta.h enum
 
-// ---------------------------------------------------------------------------
+//  
 // Alignment
-// ---------------------------------------------------------------------------
+//  
 
 pub const MPP_ALIGNMENT: u32 = 16;
 
@@ -241,9 +236,9 @@ pub fn mpp_align(v: u32) -> u32 {
     (v + MPP_ALIGNMENT - 1) & !(MPP_ALIGNMENT - 1)
 }
 
-// ---------------------------------------------------------------------------
+//  
 // Extern "C" function declarations
-// ---------------------------------------------------------------------------
+//  
 
 #[link(name = "rockchip_mpp")]
 extern "C" {
@@ -339,9 +334,7 @@ extern "C" {
     pub fn mpp_meta_get_frame(meta: MppMeta, key: c_int, frame: *mut MppFrame) -> MppRet;
 }
 
-// ---------------------------------------------------------------------------
 // GStreamer DmaBuf allocator FFI (from libgstallocators-1.0)
-// ---------------------------------------------------------------------------
 
 pub type GstAllocator = c_void;
 pub type GstMemory = c_void;
@@ -362,16 +355,12 @@ extern "C" {
 /// GstFdMemoryFlags - GST_FD_MEMORY_FLAG_KEEP_MAPPED = 4
 pub const GST_FD_MEMORY_FLAG_KEEP_MAPPED: c_int = 4;
 
-// ---------------------------------------------------------------------------
 // MppBufferMode (from mpp_buffer.h)
-// ---------------------------------------------------------------------------
 
 pub const MPP_BUFFER_INTERNAL: c_int = 0;
 pub const MPP_BUFFER_EXTERNAL: c_int = 1;
 
-// ---------------------------------------------------------------------------
 // Wrapper functions — emulate the C macros that call _with_tag/_with_caller
-// ---------------------------------------------------------------------------
 
 const TAG: *const c_char = b"gstmppdarkgst\0".as_ptr() as *const c_char;
 const CALLER: *const c_char = b"gstmppdarkgst\0".as_ptr() as *const c_char;
@@ -444,10 +433,6 @@ pub unsafe fn mpp_buffer_import(
 ) -> MppRet {
     mpp_buffer_import_with_tag(group, info, buf, TAG, CALLER)
 }
-
-// ---------------------------------------------------------------------------
-// Safe helper to set an mpp_enc_cfg string key
-// ---------------------------------------------------------------------------
 
 pub unsafe fn enc_cfg_set_s32(cfg: MppEncCfg, key: &str, val: i32) -> MppRet {
     let ckey = std::ffi::CString::new(key).unwrap();
