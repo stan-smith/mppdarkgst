@@ -7,7 +7,7 @@ use gstreamer_video as gst_video;
 use gstreamer_video::subclass::prelude::*;
 
 use once_cell::sync::Lazy;
-use std::sync::{Arc, Mutex, Mutex as StdMutex};
+use std::sync::{Arc, Mutex};
 
 use crate::allocator::{self, MppAllocator};
 use crate::mpp_ffi::{self as ffi, MppApiStruct};
@@ -80,14 +80,14 @@ unsafe impl Sync for TaskShared {}
 
 pub struct MppVideoDec {
     state: Mutex<Option<DecoderState>>,
-    shared: Arc<StdMutex<TaskShared>>,
+    shared: Arc<Mutex<TaskShared>>,
 }
 
 impl Default for MppVideoDec {
     fn default() -> Self {
         Self {
             state: Mutex::new(None),
-            shared: Arc::new(StdMutex::new(TaskShared {
+            shared: Arc::new(Mutex::new(TaskShared {
                 flushing: false,
                 task_ret: Ok(gst::FlowSuccess::Ok),
                 task_started: false,
@@ -453,7 +453,7 @@ impl MppVideoDec {
     /// Matches vendor gstmppdec.c:gst_mpp_dec_loop().
     fn dec_loop(
         element: &super::MppVideoDec,
-        shared: &Arc<StdMutex<TaskShared>>,
+        shared: &Arc<Mutex<TaskShared>>,
     ) {
         let imp = element.imp();
 
