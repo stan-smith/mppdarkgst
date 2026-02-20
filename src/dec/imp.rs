@@ -9,6 +9,7 @@ use gstreamer_video::subclass::prelude::*;
 use once_cell::sync::Lazy;
 use std::sync::{Arc, Mutex, Mutex as StdMutex};
 
+use crate::allocator::{self, MppAllocator};
 use crate::mpp_ffi::{self as ffi, MppApiStruct};
 
 static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
@@ -28,6 +29,7 @@ struct DecoderState {
     height: u32,
     hor_stride: u32,
     ver_stride: u32,
+    allocator: MppAllocator,
 }
 
 unsafe impl Send for DecoderState {}
@@ -179,6 +181,17 @@ impl VideoDecoderImpl for MppVideoDec {
                 return Err(gst::error_msg!(gst::LibraryError::Init, ["mpp_create failed"]));
             }
 
+            let allocator = MppAllocator::new().map_err(|_| {
+                ffi::mpp_destroy(mpp_ctx);
+                gst::error_msg!(gst::LibraryError::Init, ["MppAllocator::new failed"])
+            })?;
+
+            // Tell MPP to use our DRM buffer group for decoded output (zero-copy)
+            if let Some(control) = (*mpi).control {
+                let group = allocator.mpp_group();
+                control(mpp_ctx, ffi::MPP_DEC_SET_EXT_BUF_GROUP, group as *mut _);
+            }
+
             *self.state.lock().unwrap() = Some(DecoderState {
                 mpp_ctx,
                 mpi,
@@ -188,6 +201,7 @@ impl VideoDecoderImpl for MppVideoDec {
                 height: 0,
                 hor_stride: 0,
                 ver_stride: 0,
+                allocator,
             });
         }
 
@@ -562,8 +576,8 @@ impl MppVideoDec {
             return;
         }
 
-        // Get dimensions (might need to negotiate if not yet done)
-        let (width, height, hor_stride, ver_stride) = {
+        // Get dimensions and wrap decoded buffer as zero-copy DMA-BUF
+        let output_buffer = {
             let mut dec_state = imp.state.lock().unwrap();
             let dec = match dec_state.as_mut() {
                 Some(d) => d,
@@ -587,17 +601,18 @@ impl MppVideoDec {
                 let h = dec.height;
                 drop(dec_state);
                 Self::negotiate_output(element, w, h);
-                let dec_state = imp.state.lock().unwrap();
-                let dec = dec_state.as_ref().unwrap();
-                (dec.width, dec.height, dec.hor_stride, dec.ver_stride)
-            } else {
-                (dec.width, dec.height, dec.hor_stride, dec.ver_stride)
+                dec_state = imp.state.lock().unwrap();
             }
-        };
 
-        // Copy decoded NV12 frame to output buffer
-        let output_buffer = unsafe {
-            Self::copy_decoded_frame(mpp_buf, hor_stride, ver_stride, width, height)
+            let dec = dec_state.as_ref().unwrap();
+            let buf = unsafe {
+                Self::wrap_decoded_frame(
+                    &dec.allocator, mpp_buf,
+                    dec.width, dec.height, dec.hor_stride, dec.ver_stride,
+                )
+            };
+            drop(dec_state);
+            buf
         };
         unsafe { ffi::mpp_frame_deinit(&mut { mpp_frame }); }
 
@@ -641,59 +656,39 @@ impl MppVideoDec {
         }
     }
 
-    /// Copy decoded NV12 data from MppBuffer to a regular GstBuffer.
-    unsafe fn copy_decoded_frame(
+    /// Wrap decoded NV12 MppBuffer as zero-copy DMA-BUF GstBuffer with VideoMeta.
+    unsafe fn wrap_decoded_frame(
+        alloc: &MppAllocator,
         mpp_buf: ffi::MppBuffer,
-        hor_stride: u32,
-        ver_stride: u32,
         width: u32,
         height: u32,
+        hor_stride: u32,
+        ver_stride: u32,
     ) -> Option<gst::Buffer> {
-        let src_ptr = ffi::mpp_buffer_get_ptr(mpp_buf) as *const u8;
-        if src_ptr.is_null() {
-            return None;
-        }
+        let buf_size = (hor_stride as usize) * (ver_stride as usize) * 3 / 2;
 
-        let frame_size = (width * height * 3 / 2) as usize;
-        let mut buffer = gst::Buffer::with_size(frame_size).ok()?;
+        let mem = allocator::wrap_mpp_buffer_as_dmabuf_memory(alloc, mpp_buf, buf_size)?;
+
+        let mut buffer = gst::Buffer::new();
         {
             let buf_mut = buffer.get_mut().unwrap();
-            let mut map = buf_mut.map_writable().ok()?;
-            let dst = map.as_mut_slice();
+            buf_mut.append_memory(mem);
 
-            let src_stride = hor_stride as usize;
-            let w = width as usize;
-            let h = height as usize;
+            // NV12: plane 0 = Y (offset 0, stride = hor_stride)
+            //       plane 1 = UV (offset = hor_stride * ver_stride, stride = hor_stride)
+            let offsets = [0usize, (hor_stride * ver_stride) as usize];
+            let strides = [hor_stride as i32, hor_stride as i32];
 
-            if w == src_stride {
-                let copy_size = frame_size.min(ffi::mpp_buffer_get_size(mpp_buf));
-                std::ptr::copy_nonoverlapping(src_ptr, dst.as_mut_ptr(), copy_size);
-            } else {
-                // Copy Y plane line-by-line
-                for y in 0..h {
-                    let src_off = y * src_stride;
-                    let dst_off = y * w;
-                    std::ptr::copy_nonoverlapping(
-                        src_ptr.add(src_off),
-                        dst.as_mut_ptr().add(dst_off),
-                        w,
-                    );
-                }
-                // Copy UV plane line-by-line
-                let src_uv_base = (ver_stride as usize) * src_stride;
-                let dst_uv_base = h * w;
-                for y in 0..h / 2 {
-                    let src_off = src_uv_base + y * src_stride;
-                    let dst_off = dst_uv_base + y * w;
-                    std::ptr::copy_nonoverlapping(
-                        src_ptr.add(src_off),
-                        dst.as_mut_ptr().add(dst_off),
-                        w,
-                    );
-                }
-            }
+            let _ = gst_video::VideoMeta::add_full(
+                buf_mut,
+                gst_video::VideoFrameFlags::empty(),
+                gst_video::VideoFormat::Nv12,
+                width,
+                height,
+                &offsets,
+                &strides,
+            );
         }
-
         Some(buffer)
     }
 }
