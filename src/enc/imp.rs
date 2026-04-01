@@ -10,7 +10,7 @@ use once_cell::sync::Lazy;
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 
-use crate::allocator::{self, MppAllocator};
+use crate::allocator::MppAllocator;
 use crate::mpp_ffi::{self as ffi, MppApiStruct};
 
 static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
@@ -81,14 +81,16 @@ impl Drop for EncoderState {
 /// Queued input frame: MppFrame ready to submit to encoder.
 struct QueuedFrame {
     mpp_frame: ffi::MppFrame,
-    mpp_buf: ffi::MppBuffer,
 }
 
 /// Shared state between handle_frame (pipeline thread) and enc_loop (srcpad task).
 struct TaskShared {
     pending_frames: u32,
     frame_queue: VecDeque<QueuedFrame>,
-    in_flight_bufs: VecDeque<ffi::MppBuffer>,
+    /// MppFrames submitted to encoder, awaiting encode_get_packet.
+    /// mpp_frame_deinit is called when the corresponding packet arrives,
+    /// which releases the buffer ref (mpp_frame_set_buffer did inc_ref).
+    in_flight_frames: VecDeque<ffi::MppFrame>,
     flushing: bool,
     task_ret: Result<gst::FlowSuccess, gst::FlowError>,
     task_started: bool,
@@ -115,7 +117,7 @@ impl Default for MppH265Enc {
                 Mutex::new(TaskShared {
                     pending_frames: 0,
                     frame_queue: VecDeque::new(),
-                    in_flight_bufs: VecDeque::new(),
+                    in_flight_frames: VecDeque::new(),
                     flushing: false,
                     task_ret: Ok(gst::FlowSuccess::Ok),
                     task_started: false,
@@ -244,7 +246,7 @@ impl VideoEncoderImpl for MppH265Enc {
             let mut shared = self.shared.0.lock().unwrap();
             shared.pending_frames = 0;
             shared.frame_queue.clear();
-            shared.in_flight_bufs.clear();
+            shared.in_flight_frames.clear();
             shared.flushing = false;
             shared.task_ret = Ok(gst::FlowSuccess::Ok);
             shared.task_started = false;
@@ -324,17 +326,19 @@ impl VideoEncoderImpl for MppH265Enc {
         {
             let mut shared = self.shared.0.lock().unwrap();
             shared.flushing = true;
-            // Clean up any queued MppFrames and their input buffers
+            // Clean up any queued MppFrames (deinit releases the buffer ref)
             for qf in shared.frame_queue.drain(..) {
                 unsafe {
                     let mut f = qf.mpp_frame;
                     ffi::mpp_frame_deinit(&mut f);
-                    ffi::mpp_buffer_put(qf.mpp_buf);
                 }
             }
-            // Release in-flight input buffers (submitted but not yet encoded)
-            for buf in shared.in_flight_bufs.drain(..) {
-                unsafe { ffi::mpp_buffer_put(buf); }
+            // Release in-flight frames (submitted but not yet returned by encoder)
+            for frame in shared.in_flight_frames.drain(..) {
+                unsafe {
+                    let mut f = frame;
+                    ffi::mpp_frame_deinit(&mut f);
+                }
             }
             shared.pending_frames = 0;
         }
@@ -463,7 +467,7 @@ impl VideoEncoderImpl for MppH265Enc {
         frame: gst_video::VideoCodecFrame,
     ) -> Result<gst::FlowSuccess, gst::FlowError> {
         // Copy input to MppBuffer and prepare MppFrame
-        let (mpp_frame, mpp_buf) = {
+        let mpp_frame = {
             let mut enc_state = self.state.lock().unwrap();
             let enc = enc_state.as_mut().ok_or(gst::FlowError::NotNegotiated)?;
 
@@ -483,13 +487,15 @@ impl VideoEncoderImpl for MppH265Enc {
                 ffi::mpp_frame_set_ver_stride(mpp_frame, enc.ver_stride);
                 ffi::mpp_frame_set_fmt(mpp_frame, ffi::MPP_FMT_YUV420SP);
                 ffi::mpp_frame_set_buffer(mpp_frame, mpp_buf);
+                // Release our buffer ref — frame now owns it (set_buffer did inc_ref)
+                ffi::mpp_buffer_put(mpp_buf);
                 ffi::mpp_frame_set_eos(mpp_frame, 0);
 
                 if let Some(p) = frame.pts() {
                     ffi::mpp_frame_set_pts(mpp_frame, p.nseconds() as i64);
                 }
 
-                (mpp_frame, mpp_buf)
+                mpp_frame
             }
         }; // enc_state lock dropped here
 
@@ -500,11 +506,10 @@ impl VideoEncoderImpl for MppH265Enc {
         {
             let mut shared = self.shared.0.lock().unwrap();
             if shared.flushing {
-                // Clean up the MppFrame and input buffer
+                // Clean up the MppFrame (deinit releases the buffer ref)
                 unsafe {
                     let mut f = mpp_frame;
                     ffi::mpp_frame_deinit(&mut f);
-                    ffi::mpp_buffer_put(mpp_buf);
                 }
                 return Err(gst::FlowError::Flushing);
             }
@@ -559,7 +564,6 @@ impl VideoEncoderImpl for MppH265Enc {
                     unsafe {
                         let mut f = mpp_frame;
                         ffi::mpp_frame_deinit(&mut f);
-                        ffi::mpp_buffer_put(mpp_buf);
                     }
                     return Err(gst::FlowError::Flushing);
                 }
@@ -572,7 +576,6 @@ impl VideoEncoderImpl for MppH265Enc {
             shared.pending_frames += 1;
             shared.frame_queue.push_back(QueuedFrame {
                 mpp_frame,
-                mpp_buf,
             });
             self.shared.1.notify_one();
             shared.task_ret.clone()
@@ -588,17 +591,19 @@ impl VideoEncoderImpl for MppH265Enc {
         {
             let mut shared = self.shared.0.lock().unwrap();
             shared.flushing = true;
-            // Clean up queued MppFrames and their input buffers
+            // Clean up queued MppFrames (deinit releases the buffer ref)
             for qf in shared.frame_queue.drain(..) {
                 unsafe {
                     let mut f = qf.mpp_frame;
                     ffi::mpp_frame_deinit(&mut f);
-                    ffi::mpp_buffer_put(qf.mpp_buf);
                 }
             }
-            // Release in-flight input buffers
-            for buf in shared.in_flight_bufs.drain(..) {
-                unsafe { ffi::mpp_buffer_put(buf); }
+            // Release in-flight frames
+            for frame in shared.in_flight_frames.drain(..) {
+                unsafe {
+                    let mut f = frame;
+                    ffi::mpp_frame_deinit(&mut f);
+                }
             }
             shared.pending_frames = 0;
         }
@@ -684,11 +689,10 @@ impl MppH265Enc {
 
             let enc_guard = imp.state.lock().unwrap();
             let Some(ref enc) = *enc_guard else {
-                // Encoder stopped — clean up
+                // Encoder stopped — clean up (deinit releases buffer ref)
                 unsafe {
                     let mut f = qf.mpp_frame;
                     ffi::mpp_frame_deinit(&mut f);
-                    ffi::mpp_buffer_put(qf.mpp_buf);
                 }
                 break;
             };
@@ -699,23 +703,22 @@ impl MppH265Enc {
                     None => {
                         let mut f = qf.mpp_frame;
                         ffi::mpp_frame_deinit(&mut f);
-                        ffi::mpp_buffer_put(qf.mpp_buf);
                         break;
                     }
                 };
 
                 let ret = put_frame(enc.mpp_ctx, qf.mpp_frame);
-                let mut f = qf.mpp_frame;
-                ffi::mpp_frame_deinit(&mut f);
 
                 if ret != ffi::MPP_OK {
                     gst::warning!(CAT, obj = element, "encode_put_frame failed: {}", ret);
-                    // Put_frame failed — release buffer immediately
-                    ffi::mpp_buffer_put(qf.mpp_buf);
+                    // Put_frame failed — deinit frame (releases buffer ref)
+                    let mut f = qf.mpp_frame;
+                    ffi::mpp_frame_deinit(&mut f);
                 } else {
-                    // Buffer is in-flight — encoder is reading it asynchronously
+                    // Frame is in-flight — encoder owns it now.
+                    // Will be deinited when the encoded packet arrives.
                     let mut guard = mtx.lock().unwrap();
-                    guard.in_flight_bufs.push_back(qf.mpp_buf);
+                    guard.in_flight_frames.push_back(qf.mpp_frame);
                 }
             }
 
@@ -742,34 +745,19 @@ impl MppH265Enc {
             let pkt_buf = unsafe { ffi::mpp_packet_get_buffer(pkt) };
             let pkt_len = unsafe { ffi::mpp_packet_get_length(pkt) };
 
+            // Memcpy encoded packet to GstBuffer. Encoded H.265 packets are small
+            // (~36KB), so memcpy is negligible. DMA-BUF zero-copy for output is
+            // problematic due to MPP output pool refcount semantics.
             let output_buffer = if !pkt_buf.is_null() && pkt_len > 0 {
-                let mem = allocator::wrap_mpp_buffer_as_dmabuf_memory(
-                    &enc.allocator,
-                    pkt_buf,
-                    pkt_len,
-                );
-                match mem {
-                    Some(mem) => {
-                        let mut buf = gst::Buffer::new();
-                        {
-                            let buf_mut = buf.get_mut().unwrap();
-                            buf_mut.append_memory(mem);
-                        }
-                        Some(buf)
-                    }
-                    None => {
-                        // Fallback: memcpy
-                        let pkt_ptr = unsafe { ffi::mpp_buffer_get_ptr(pkt_buf) as *const u8 };
-                        let src = unsafe { std::slice::from_raw_parts(pkt_ptr, pkt_len) };
-                        let mut buf = gst::Buffer::with_size(pkt_len).unwrap();
-                        {
-                            let buf_mut = buf.get_mut().unwrap();
-                            let mut map = buf_mut.map_writable().unwrap();
-                            map.as_mut_slice().copy_from_slice(src);
-                        }
-                        Some(buf)
-                    }
+                let pkt_ptr = unsafe { ffi::mpp_buffer_get_ptr(pkt_buf) as *const u8 };
+                let src = unsafe { std::slice::from_raw_parts(pkt_ptr, pkt_len) };
+                let mut buf = gst::Buffer::with_size(pkt_len).unwrap();
+                {
+                    let buf_mut = buf.get_mut().unwrap();
+                    let mut map = buf_mut.map_writable().unwrap();
+                    map.as_mut_slice().copy_from_slice(src);
                 }
+                Some(buf)
             } else {
                 None
             };
@@ -785,12 +773,15 @@ impl MppH265Enc {
                 }
                 let ret = gst_video::prelude::VideoEncoderExt::finish_frame(element, f);
 
-                // Release the oldest in-flight input buffer (encoder is done with it)
-                // and decrement pending count
+                // Release the oldest in-flight input frame (encoder is done with it).
+                // mpp_frame_deinit releases the buffer ref that mpp_frame_set_buffer added.
                 {
                     let mut guard = mtx.lock().unwrap();
-                    if let Some(buf) = guard.in_flight_bufs.pop_front() {
-                        unsafe { ffi::mpp_buffer_put(buf); }
+                    if let Some(frame) = guard.in_flight_frames.pop_front() {
+                        unsafe {
+                            let mut f = frame;
+                            ffi::mpp_frame_deinit(&mut f);
+                        }
                     }
                     if guard.pending_frames > 0 {
                         guard.pending_frames -= 1;
@@ -808,10 +799,13 @@ impl MppH265Enc {
                     return;
                 }
             } else {
-                // No frame waiting — shouldn't happen, but release buffer and decrement
+                // No frame waiting — shouldn't happen, but release in-flight frame and decrement
                 let mut guard = mtx.lock().unwrap();
-                if let Some(buf) = guard.in_flight_bufs.pop_front() {
-                    unsafe { ffi::mpp_buffer_put(buf); }
+                if let Some(frame) = guard.in_flight_frames.pop_front() {
+                    unsafe {
+                        let mut f = frame;
+                        ffi::mpp_frame_deinit(&mut f);
+                    }
                 }
                 if guard.pending_frames > 0 {
                     guard.pending_frames -= 1;
