@@ -1,5 +1,4 @@
 use glib::subclass::prelude::*;
-use glib::translate::*;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer::subclass::prelude::*;
@@ -7,8 +6,7 @@ use gstreamer_video as gst_video;
 use gstreamer_video::subclass::prelude::*;
 
 use once_cell::sync::Lazy;
-use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Mutex;
 
 use crate::allocator::MppAllocator;
 use crate::mpp_ffi::{self as ffi, MppApiStruct};
@@ -19,7 +17,8 @@ static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
 
 const DEFAULT_BPS: u32 = 4_000_000;
 const DEFAULT_GOP: i32 = 60;
-const MAX_PENDING: u32 = 16;
+/// Max poll attempts for encode_get_packet (100ms timeout each → 500ms max)
+const MAX_POLL_ATTEMPTS: u32 = 5;
 
 #[derive(Debug, Clone)]
 struct Settings {
@@ -41,6 +40,8 @@ struct EncoderState {
     mpi: *mut MppApiStruct,
     mpp_cfg: ffi::MppEncCfg,
     allocator: MppAllocator,
+    /// Pre-allocated input buffer, reused for every frame (sync encoder)
+    input_buf: ffi::MppBuffer,
     hor_stride: u32,
     ver_stride: u32,
     width: u32,
@@ -72,40 +73,18 @@ impl Drop for EncoderState {
                 }
                 ffi::mpp_frame_deinit(&mut eos_frame);
             }
+            if !self.input_buf.is_null() {
+                ffi::mpp_buffer_put(self.input_buf);
+            }
             ffi::mpp_enc_cfg_deinit(self.mpp_cfg);
             ffi::mpp_destroy(self.mpp_ctx);
         }
     }
 }
 
-/// Queued input frame: MppFrame ready to submit to encoder.
-struct QueuedFrame {
-    mpp_frame: ffi::MppFrame,
-}
-
-/// Shared state between handle_frame (pipeline thread) and enc_loop (srcpad task).
-struct TaskShared {
-    pending_frames: u32,
-    frame_queue: VecDeque<QueuedFrame>,
-    /// MppFrames submitted to encoder, awaiting encode_get_packet.
-    /// mpp_frame_deinit is called when the corresponding packet arrives,
-    /// which releases the buffer ref (mpp_frame_set_buffer did inc_ref).
-    in_flight_frames: VecDeque<ffi::MppFrame>,
-    flushing: bool,
-    task_ret: Result<gst::FlowSuccess, gst::FlowError>,
-    task_started: bool,
-}
-
-// Safety: QueuedFrame contains MppFrame (raw pointer) which is only accessed
-// while holding the TaskShared mutex. MPP frames are thread-safe.
-unsafe impl Send for QueuedFrame {}
-unsafe impl Send for TaskShared {}
-unsafe impl Sync for TaskShared {}
-
 pub struct MppH265Enc {
     settings: Mutex<Settings>,
     state: Mutex<Option<EncoderState>>,
-    shared: Arc<(Mutex<TaskShared>, Condvar)>,
 }
 
 impl Default for MppH265Enc {
@@ -113,17 +92,6 @@ impl Default for MppH265Enc {
         Self {
             settings: Mutex::new(Settings::default()),
             state: Mutex::new(None),
-            shared: Arc::new((
-                Mutex::new(TaskShared {
-                    pending_frames: 0,
-                    frame_queue: VecDeque::new(),
-                    in_flight_frames: VecDeque::new(),
-                    flushing: false,
-                    task_ret: Ok(gst::FlowSuccess::Ok),
-                    task_started: false,
-                }),
-                Condvar::new(),
-            )),
         }
     }
 }
@@ -241,17 +209,6 @@ impl VideoEncoderImpl for MppH265Enc {
     fn start(&self) -> Result<(), gst::ErrorMessage> {
         gst::debug!(CAT, imp = self, "start");
 
-        // Reset shared state
-        {
-            let mut shared = self.shared.0.lock().unwrap();
-            shared.pending_frames = 0;
-            shared.frame_queue.clear();
-            shared.in_flight_frames.clear();
-            shared.flushing = false;
-            shared.task_ret = Ok(gst::FlowSuccess::Ok);
-            shared.task_started = false;
-        }
-
         let allocator = MppAllocator::new().map_err(|_| {
             gst::error_msg!(gst::LibraryError::Init, ["MppAllocator::new failed"])
         })?;
@@ -265,7 +222,7 @@ impl VideoEncoderImpl for MppH265Enc {
             }
 
             if let Some(control) = (*mpi).control {
-                let mut timeout: i64 = 1; // 1ms output poll
+                let mut timeout: i64 = 100; // 100ms — blocks in get_packet until packet ready
                 control(mpp_ctx, ffi::MPP_SET_OUTPUT_TIMEOUT, &mut timeout as *mut i64 as ffi::MppParam);
             }
 
@@ -308,6 +265,7 @@ impl VideoEncoderImpl for MppH265Enc {
                 mpi,
                 mpp_cfg,
                 allocator,
+                input_buf: std::ptr::null_mut(),
                 hor_stride: 0,
                 ver_stride: 0,
                 width: 0,
@@ -321,34 +279,6 @@ impl VideoEncoderImpl for MppH265Enc {
 
     fn stop(&self) -> Result<(), gst::ErrorMessage> {
         gst::debug!(CAT, imp = self, "stop");
-
-        // Signal flushing to wake up task
-        {
-            let mut shared = self.shared.0.lock().unwrap();
-            shared.flushing = true;
-            // Clean up any queued MppFrames (deinit releases the buffer ref)
-            for qf in shared.frame_queue.drain(..) {
-                unsafe {
-                    let mut f = qf.mpp_frame;
-                    ffi::mpp_frame_deinit(&mut f);
-                }
-            }
-            // Release in-flight frames (submitted but not yet returned by encoder)
-            for frame in shared.in_flight_frames.drain(..) {
-                unsafe {
-                    let mut f = frame;
-                    ffi::mpp_frame_deinit(&mut f);
-                }
-            }
-            shared.pending_frames = 0;
-        }
-        self.shared.1.notify_all();
-
-        // Stop the srcpad task
-        let obj = self.obj();
-        let src_pad = gst_video::prelude::VideoEncoderExtManual::src_pad(&*obj);
-        let _ = src_pad.stop_task();
-
         *self.state.lock().unwrap() = None;
         Ok(())
     }
@@ -397,6 +327,19 @@ impl VideoEncoderImpl for MppH265Enc {
         enc.ver_stride = ver_stride;
         enc.width = width;
         enc.height = height;
+
+        // (Re-)allocate the persistent input buffer for the new resolution
+        unsafe {
+            if !enc.input_buf.is_null() {
+                ffi::mpp_buffer_put(enc.input_buf);
+                enc.input_buf = std::ptr::null_mut();
+            }
+            let frame_size = (hor_stride * ver_stride * 3 / 2) as usize;
+            let (buf, _fd) = enc.allocator.alloc(frame_size).map_err(|_| {
+                gst::loggable_error!(CAT, "failed to allocate persistent input buffer")
+            })?;
+            enc.input_buf = buf;
+        }
 
         unsafe {
             let cfg = enc.mpp_cfg;
@@ -464,157 +407,100 @@ impl VideoEncoderImpl for MppH265Enc {
 
     fn handle_frame(
         &self,
-        frame: gst_video::VideoCodecFrame,
+        mut frame: gst_video::VideoCodecFrame,
     ) -> Result<gst::FlowSuccess, gst::FlowError> {
-        // Copy input to MppBuffer and prepare MppFrame
-        let mpp_frame = {
-            let mut enc_state = self.state.lock().unwrap();
-            let enc = enc_state.as_mut().ok_or(gst::FlowError::NotNegotiated)?;
+        let mut enc_state = self.state.lock().unwrap();
+        let enc = enc_state.as_mut().ok_or(gst::FlowError::NotNegotiated)?;
 
-            let input_buffer = frame.input_buffer().ok_or(gst::FlowError::Error)?;
-            let mpp_buf = self.copy_input_to_mpp(enc, input_buffer)?;
+        // Copy input to pre-allocated MppBuffer
+        let input_buffer = frame.input_buffer().ok_or(gst::FlowError::Error)?;
+        self.copy_input_to_mpp(enc, input_buffer)?;
 
-            unsafe {
-                let mut mpp_frame: ffi::MppFrame = std::ptr::null_mut();
-                if ffi::mpp_frame_init(&mut mpp_frame) != ffi::MPP_OK {
-                    ffi::mpp_buffer_put(mpp_buf);
-                    return Err(gst::FlowError::Error);
-                }
-
-                ffi::mpp_frame_set_width(mpp_frame, enc.width);
-                ffi::mpp_frame_set_height(mpp_frame, enc.height);
-                ffi::mpp_frame_set_hor_stride(mpp_frame, enc.hor_stride);
-                ffi::mpp_frame_set_ver_stride(mpp_frame, enc.ver_stride);
-                ffi::mpp_frame_set_fmt(mpp_frame, ffi::MPP_FMT_YUV420SP);
-                ffi::mpp_frame_set_buffer(mpp_frame, mpp_buf);
-                // Release our buffer ref — frame now owns it (set_buffer did inc_ref)
-                ffi::mpp_buffer_put(mpp_buf);
-                ffi::mpp_frame_set_eos(mpp_frame, 0);
-
-                if let Some(p) = frame.pts() {
-                    ffi::mpp_frame_set_pts(mpp_frame, p.nseconds() as i64);
-                }
-
-                mpp_frame
+        // Create MppFrame and submit to encoder
+        let mut mpp_frame: ffi::MppFrame = std::ptr::null_mut();
+        unsafe {
+            if ffi::mpp_frame_init(&mut mpp_frame) != ffi::MPP_OK {
+                return Err(gst::FlowError::Error);
             }
-        }; // enc_state lock dropped here
 
-        // Drop frame to release stream lock ref count (from VideoCodecFrame)
-        drop(frame);
+            ffi::mpp_frame_set_width(mpp_frame, enc.width);
+            ffi::mpp_frame_set_height(mpp_frame, enc.height);
+            ffi::mpp_frame_set_hor_stride(mpp_frame, enc.hor_stride);
+            ffi::mpp_frame_set_ver_stride(mpp_frame, enc.ver_stride);
+            ffi::mpp_frame_set_fmt(mpp_frame, ffi::MPP_FMT_YUV420SP);
+            // set_buffer inc_refs the buffer; we keep our ref since we reuse it
+            ffi::mpp_frame_set_buffer(mpp_frame, enc.input_buf);
+            ffi::mpp_frame_set_eos(mpp_frame, 0);
 
-        // Start srcpad task if not already running
-        {
-            let mut shared = self.shared.0.lock().unwrap();
-            if shared.flushing {
-                // Clean up the MppFrame (deinit releases the buffer ref)
-                unsafe {
-                    let mut f = mpp_frame;
-                    ffi::mpp_frame_deinit(&mut f);
+            if let Some(p) = frame.pts() {
+                ffi::mpp_frame_set_pts(mpp_frame, p.nseconds() as i64);
+            }
+
+            // Submit frame to MPP
+            let put_frame = (*enc.mpi).encode_put_frame.ok_or_else(|| {
+                ffi::mpp_frame_deinit(&mut mpp_frame);
+                gst::FlowError::Error
+            })?;
+
+            let ret = put_frame(enc.mpp_ctx, mpp_frame);
+            if ret != ffi::MPP_OK {
+                gst::warning!(CAT, imp = self, "encode_put_frame failed: {}", ret);
+                ffi::mpp_frame_deinit(&mut mpp_frame);
+                return Err(gst::FlowError::Error);
+            }
+
+            // Poll for encoded packet (synchronous — blocks until packet is ready)
+            let get_packet = (*enc.mpi).encode_get_packet.ok_or(gst::FlowError::Error)?;
+            let mut pkt: ffi::MppPacket = std::ptr::null_mut();
+
+            for _ in 0..MAX_POLL_ATTEMPTS {
+                get_packet(enc.mpp_ctx, &mut pkt);
+                if !pkt.is_null() {
+                    break;
                 }
-                return Err(gst::FlowError::Flushing);
+                // encode_get_packet blocks up to 100ms (MPP_SET_OUTPUT_TIMEOUT),
+                // so no explicit sleep needed between attempts.
             }
-            if !shared.task_started {
-                let obj = self.obj();
-                let src_pad = gst_video::prelude::VideoEncoderExtManual::src_pad(&*obj);
 
-                let element = obj.clone();
-                let task_shared = Arc::clone(&self.shared);
-                src_pad
-                    .start_task(move || {
-                        Self::enc_loop(&element, &task_shared);
-                    })
-                    .map_err(|_| {
-                        gst::error!(CAT, "Failed to start srcpad task");
-                        gst::FlowError::Error
-                    })?;
-                shared.task_started = true;
-                gst::debug!(CAT, imp = self, "started srcpad encoding task");
+            // Release the MppFrame now that encoding is done.
+            // mpp_frame_deinit releases the buffer ref that mpp_frame_set_buffer added.
+            ffi::mpp_frame_deinit(&mut mpp_frame);
+
+            if pkt.is_null() {
+                gst::error!(CAT, imp = self, "encode_get_packet timed out");
+                return Err(gst::FlowError::Error);
             }
+
+            let pkt_buf = ffi::mpp_packet_get_buffer(pkt);
+            let pkt_len = ffi::mpp_packet_get_length(pkt);
+
+            // Memcpy encoded packet to GstBuffer. Encoded H.265 packets are small
+            // (~36KB), so memcpy is negligible. DMA-BUF zero-copy for output is
+            // problematic due to MPP output pool refcount semantics.
+            if !pkt_buf.is_null() && pkt_len > 0 {
+                let pkt_ptr = ffi::mpp_buffer_get_ptr(pkt_buf) as *const u8;
+                let src = std::slice::from_raw_parts(pkt_ptr, pkt_len);
+                let mut buf = gst::Buffer::with_size(pkt_len).unwrap();
+                {
+                    let buf_mut = buf.get_mut().unwrap();
+                    let mut map = buf_mut.map_writable().unwrap();
+                    map.as_mut_slice().copy_from_slice(src);
+                }
+                frame.set_output_buffer(buf);
+            }
+
+            ffi::mpp_packet_deinit(&mut pkt);
         }
 
-        // Back-pressure: release stream lock and wait if too many pending frames
-        let stream_lock = unsafe {
-            let obj = self.obj();
-            let encoder_ptr: *const gst_video::ffi::GstVideoEncoder =
-                obj.upcast_ref::<gst_video::VideoEncoder>().to_glib_none().0;
-            &(*encoder_ptr).stream_lock as *const glib::ffi::GRecMutex as *mut glib::ffi::GRecMutex
-        };
+        // Release enc_state lock before finish_frame
+        drop(enc_state);
 
-        {
-            let shared = self.shared.0.lock().unwrap();
-            if shared.pending_frames >= MAX_PENDING {
-                // Release shared lock temporarily so we can release stream lock
-                drop(shared);
-
-                // Release stream lock so the srcpad task can run
-                unsafe { glib::ffi::g_rec_mutex_unlock(stream_lock); }
-
-                // Wait for space in the queue
-                let mut shared = self.shared.0.lock().unwrap();
-                while shared.pending_frames >= MAX_PENDING && !shared.flushing {
-                    shared = self.shared.1.wait(shared).unwrap();
-                }
-                drop(shared);
-
-                // Re-acquire stream lock
-                unsafe { glib::ffi::g_rec_mutex_lock(stream_lock); }
-
-                let shared = self.shared.0.lock().unwrap();
-                if shared.flushing {
-                    unsafe {
-                        let mut f = mpp_frame;
-                        ffi::mpp_frame_deinit(&mut f);
-                    }
-                    return Err(gst::FlowError::Flushing);
-                }
-            }
-        }
-
-        // Enqueue frame and signal the task
-        let task_ret = {
-            let mut shared = self.shared.0.lock().unwrap();
-            shared.pending_frames += 1;
-            shared.frame_queue.push_back(QueuedFrame {
-                mpp_frame,
-            });
-            self.shared.1.notify_one();
-            shared.task_ret.clone()
-        };
-
-        task_ret
+        gst_video::prelude::VideoEncoderExt::finish_frame(&*self.obj(), frame)
     }
 
     fn flush(&self) -> bool {
         gst::debug!(CAT, imp = self, "flush");
 
-        // Signal flushing
-        {
-            let mut shared = self.shared.0.lock().unwrap();
-            shared.flushing = true;
-            // Clean up queued MppFrames (deinit releases the buffer ref)
-            for qf in shared.frame_queue.drain(..) {
-                unsafe {
-                    let mut f = qf.mpp_frame;
-                    ffi::mpp_frame_deinit(&mut f);
-                }
-            }
-            // Release in-flight frames
-            for frame in shared.in_flight_frames.drain(..) {
-                unsafe {
-                    let mut f = frame;
-                    ffi::mpp_frame_deinit(&mut f);
-                }
-            }
-            shared.pending_frames = 0;
-        }
-        self.shared.1.notify_all();
-
-        // Pause the task
-        let obj = self.obj();
-        let src_pad = gst_video::prelude::VideoEncoderExtManual::src_pad(&*obj);
-        let _ = src_pad.pause_task();
-
-        // Reset MPP
         let guard = self.state.lock().unwrap();
         if let Some(ref enc) = *guard {
             unsafe {
@@ -622,15 +508,6 @@ impl VideoEncoderImpl for MppH265Enc {
                     reset(enc.mpp_ctx);
                 }
             }
-        }
-        drop(guard);
-
-        // Clear flushing state
-        {
-            let mut shared = self.shared.0.lock().unwrap();
-            shared.flushing = false;
-            shared.task_ret = Ok(gst::FlowSuccess::Ok);
-            shared.task_started = false;
         }
 
         true
@@ -646,192 +523,11 @@ impl VideoEncoderImpl for MppH265Enc {
 }
 
 impl MppH265Enc {
-    /// Srcpad task loop — runs in a dedicated thread.
-    fn enc_loop(
-        element: &super::MppH265Enc,
-        shared: &Arc<(Mutex<TaskShared>, Condvar)>,
-    ) {
-        let (ref mtx, ref cvar) = **shared;
-
-        // Wait until there's work to do
-        {
-            let mut guard = mtx.lock().unwrap();
-            while guard.pending_frames == 0 && !guard.flushing {
-                guard = cvar.wait(guard).unwrap();
-            }
-
-            if guard.flushing && guard.pending_frames == 0 {
-                guard.task_ret = Err(gst::FlowError::Flushing);
-                let src_pad = gst_video::prelude::VideoEncoderExtManual::src_pad(element);
-                let _ = src_pad.pause_task();
-                return;
-            }
-        }
-
-        // Acquire stream lock
-        let stream_lock = unsafe {
-            let encoder_ptr: *const gst_video::ffi::GstVideoEncoder =
-                element.upcast_ref::<gst_video::VideoEncoder>().to_glib_none().0;
-            &(*encoder_ptr).stream_lock as *const glib::ffi::GRecMutex as *mut glib::ffi::GRecMutex
-        };
-        unsafe { glib::ffi::g_rec_mutex_lock(stream_lock); }
-
-        let imp = element.imp();
-
-        // Send all queued frames to MPP (non-blocking)
-        loop {
-            let queued = {
-                let mut guard = mtx.lock().unwrap();
-                guard.frame_queue.pop_front()
-            };
-
-            let Some(qf) = queued else { break };
-
-            let enc_guard = imp.state.lock().unwrap();
-            let Some(ref enc) = *enc_guard else {
-                // Encoder stopped — clean up (deinit releases buffer ref)
-                unsafe {
-                    let mut f = qf.mpp_frame;
-                    ffi::mpp_frame_deinit(&mut f);
-                }
-                break;
-            };
-
-            unsafe {
-                let put_frame = match (*enc.mpi).encode_put_frame {
-                    Some(f) => f,
-                    None => {
-                        let mut f = qf.mpp_frame;
-                        ffi::mpp_frame_deinit(&mut f);
-                        break;
-                    }
-                };
-
-                let ret = put_frame(enc.mpp_ctx, qf.mpp_frame);
-
-                if ret != ffi::MPP_OK {
-                    gst::warning!(CAT, obj = element, "encode_put_frame failed: {}", ret);
-                    // Put_frame failed — deinit frame (releases buffer ref)
-                    let mut f = qf.mpp_frame;
-                    ffi::mpp_frame_deinit(&mut f);
-                } else {
-                    // Frame is in-flight — encoder owns it now.
-                    // Will be deinited when the encoded packet arrives.
-                    let mut guard = mtx.lock().unwrap();
-                    guard.in_flight_frames.push_back(qf.mpp_frame);
-                }
-            }
-
-            drop(enc_guard);
-        }
-
-        // Poll for encoded packets from MPP (1ms timeout per attempt)
-        loop {
-            let enc_guard = imp.state.lock().unwrap();
-            let Some(ref enc) = *enc_guard else { break };
-
-            let get_packet = match unsafe { (*enc.mpi).encode_get_packet } {
-                Some(f) => f,
-                None => break,
-            };
-
-            let mut pkt: ffi::MppPacket = std::ptr::null_mut();
-            unsafe { get_packet(enc.mpp_ctx, &mut pkt); }
-
-            if pkt.is_null() {
-                break;
-            }
-
-            let pkt_buf = unsafe { ffi::mpp_packet_get_buffer(pkt) };
-            let pkt_len = unsafe { ffi::mpp_packet_get_length(pkt) };
-
-            // Memcpy encoded packet to GstBuffer. Encoded H.265 packets are small
-            // (~36KB), so memcpy is negligible. DMA-BUF zero-copy for output is
-            // problematic due to MPP output pool refcount semantics.
-            let output_buffer = if !pkt_buf.is_null() && pkt_len > 0 {
-                let pkt_ptr = unsafe { ffi::mpp_buffer_get_ptr(pkt_buf) as *const u8 };
-                let src = unsafe { std::slice::from_raw_parts(pkt_ptr, pkt_len) };
-                let mut buf = gst::Buffer::with_size(pkt_len).unwrap();
-                {
-                    let buf_mut = buf.get_mut().unwrap();
-                    let mut map = buf_mut.map_writable().unwrap();
-                    map.as_mut_slice().copy_from_slice(src);
-                }
-                Some(buf)
-            } else {
-                None
-            };
-
-            unsafe { ffi::mpp_packet_deinit(&mut pkt); }
-            drop(enc_guard);
-
-            // Finish the oldest pending frame with the encoded output
-            let oldest = gst_video::prelude::VideoEncoderExtManual::oldest_frame(element);
-            if let Some(mut f) = oldest {
-                if let Some(buf) = output_buffer {
-                    f.set_output_buffer(buf);
-                }
-                let ret = gst_video::prelude::VideoEncoderExt::finish_frame(element, f);
-
-                // Release the oldest in-flight input frame (encoder is done with it).
-                // mpp_frame_deinit releases the buffer ref that mpp_frame_set_buffer added.
-                {
-                    let mut guard = mtx.lock().unwrap();
-                    if let Some(frame) = guard.in_flight_frames.pop_front() {
-                        unsafe {
-                            let mut f = frame;
-                            ffi::mpp_frame_deinit(&mut f);
-                        }
-                    }
-                    if guard.pending_frames > 0 {
-                        guard.pending_frames -= 1;
-                    }
-                    if ret.is_err() {
-                        guard.task_ret = ret;
-                    }
-                    cvar.notify_all();
-                }
-
-                if ret.is_err() {
-                    let src_pad = gst_video::prelude::VideoEncoderExtManual::src_pad(element);
-                    let _ = src_pad.pause_task();
-                    unsafe { glib::ffi::g_rec_mutex_unlock(stream_lock); }
-                    return;
-                }
-            } else {
-                // No frame waiting — shouldn't happen, but release in-flight frame and decrement
-                let mut guard = mtx.lock().unwrap();
-                if let Some(frame) = guard.in_flight_frames.pop_front() {
-                    unsafe {
-                        let mut f = frame;
-                        ffi::mpp_frame_deinit(&mut f);
-                    }
-                }
-                if guard.pending_frames > 0 {
-                    guard.pending_frames -= 1;
-                }
-                cvar.notify_all();
-                break;
-            }
-        }
-
-        // Check if we should stop
-        {
-            let guard = mtx.lock().unwrap();
-            if guard.task_ret.is_err() {
-                let src_pad = gst_video::prelude::VideoEncoderExtManual::src_pad(element);
-                let _ = src_pad.pause_task();
-            }
-        }
-
-        unsafe { glib::ffi::g_rec_mutex_unlock(stream_lock); }
-    }
-
     fn copy_input_to_mpp(
         &self,
         enc: &EncoderState,
         buffer: &gst::BufferRef,
-    ) -> Result<ffi::MppBuffer, gst::FlowError> {
+    ) -> Result<(), gst::FlowError> {
         let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
         let input_data = map.as_slice();
 
@@ -840,11 +536,8 @@ impl MppH265Enc {
         let frame_size = (hor_stride * ver_stride * 3 / 2) as usize;
 
         unsafe {
-            let (mpp_buf, _fd) = enc.allocator.alloc(frame_size).map_err(|_| {
-                gst::error!(CAT, imp = self, "mpp_buffer alloc failed");
-                gst::FlowError::Error
-            })?;
-
+            // Reuse pre-allocated input buffer (allocated once in set_format)
+            let mpp_buf = enc.input_buf;
             let dst_ptr = ffi::mpp_buffer_get_ptr(mpp_buf) as *mut u8;
             let width = enc.width as usize;
             let height = enc.height as usize;
@@ -882,7 +575,7 @@ impl MppH265Enc {
                 }
             }
 
-            Ok(mpp_buf)
+            Ok(())
         }
     }
 }
