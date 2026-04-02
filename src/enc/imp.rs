@@ -40,8 +40,11 @@ struct EncoderState {
     mpi: *mut MppApiStruct,
     mpp_cfg: ffi::MppEncCfg,
     allocator: MppAllocator,
-    /// Pre-allocated input buffer, reused for every frame (sync encoder)
-    input_buf: ffi::MppBuffer,
+    /// Ping-pong input buffers: write to one while MPP encodes from the other
+    input_bufs: [ffi::MppBuffer; 2],
+    buf_index: usize,
+    /// In-flight MppFrame from previous submission (deinit when packet arrives)
+    in_flight_frame: ffi::MppFrame,
     hor_stride: u32,
     ver_stride: u32,
     width: u32,
@@ -73,8 +76,13 @@ impl Drop for EncoderState {
                 }
                 ffi::mpp_frame_deinit(&mut eos_frame);
             }
-            if !self.input_buf.is_null() {
-                ffi::mpp_buffer_put(self.input_buf);
+            if !self.in_flight_frame.is_null() {
+                ffi::mpp_frame_deinit(&mut self.in_flight_frame);
+            }
+            for buf in &self.input_bufs {
+                if !buf.is_null() {
+                    ffi::mpp_buffer_put(*buf);
+                }
             }
             ffi::mpp_enc_cfg_deinit(self.mpp_cfg);
             ffi::mpp_destroy(self.mpp_ctx);
@@ -265,7 +273,9 @@ impl VideoEncoderImpl for MppH265Enc {
                 mpi,
                 mpp_cfg,
                 allocator,
-                input_buf: std::ptr::null_mut(),
+                input_bufs: [std::ptr::null_mut(), std::ptr::null_mut()],
+                buf_index: 0,
+                in_flight_frame: std::ptr::null_mut(),
                 hor_stride: 0,
                 ver_stride: 0,
                 width: 0,
@@ -328,17 +338,20 @@ impl VideoEncoderImpl for MppH265Enc {
         enc.width = width;
         enc.height = height;
 
-        // (Re-)allocate the persistent input buffer for the new resolution
+        // (Re-)allocate ping-pong input buffers for the new resolution
         unsafe {
-            if !enc.input_buf.is_null() {
-                ffi::mpp_buffer_put(enc.input_buf);
-                enc.input_buf = std::ptr::null_mut();
+            for i in 0..2 {
+                if !enc.input_bufs[i].is_null() {
+                    ffi::mpp_buffer_put(enc.input_bufs[i]);
+                    enc.input_bufs[i] = std::ptr::null_mut();
+                }
+                let frame_size = (hor_stride * ver_stride * 3 / 2) as usize;
+                let (buf, _fd) = enc.allocator.alloc(frame_size).map_err(|_| {
+                    gst::loggable_error!(CAT, "failed to allocate input buffer {}", i)
+                })?;
+                enc.input_bufs[i] = buf;
             }
-            let frame_size = (hor_stride * ver_stride * 3 / 2) as usize;
-            let (buf, _fd) = enc.allocator.alloc(frame_size).map_err(|_| {
-                gst::loggable_error!(CAT, "failed to allocate persistent input buffer")
-            })?;
-            enc.input_buf = buf;
+            enc.buf_index = 0;
         }
 
         unsafe {
@@ -407,18 +420,25 @@ impl VideoEncoderImpl for MppH265Enc {
 
     fn handle_frame(
         &self,
-        mut frame: gst_video::VideoCodecFrame,
+        frame: gst_video::VideoCodecFrame,
     ) -> Result<gst::FlowSuccess, gst::FlowError> {
         let mut enc_state = self.state.lock().unwrap();
         let enc = enc_state.as_mut().ok_or(gst::FlowError::NotNegotiated)?;
 
-        // Copy input to pre-allocated MppBuffer
+        // 1) If there's an in-flight frame, retrieve its encoded packet first
+        let prev_result = if !enc.in_flight_frame.is_null() {
+            Some(self.poll_and_finish_pending(enc)?)
+        } else {
+            None
+        };
+
+        // 2) Copy input to the current ping-pong buffer
         let input_buffer = frame.input_buffer().ok_or(gst::FlowError::Error)?;
         self.copy_input_to_mpp(enc, input_buffer)?;
 
-        // Create MppFrame and submit to encoder
-        let mut mpp_frame: ffi::MppFrame = std::ptr::null_mut();
+        // 3) Submit current frame to MPP (non-blocking — packet retrieved next call)
         unsafe {
+            let mut mpp_frame: ffi::MppFrame = std::ptr::null_mut();
             if ffi::mpp_frame_init(&mut mpp_frame) != ffi::MPP_OK {
                 return Err(gst::FlowError::Error);
             }
@@ -428,15 +448,13 @@ impl VideoEncoderImpl for MppH265Enc {
             ffi::mpp_frame_set_hor_stride(mpp_frame, enc.hor_stride);
             ffi::mpp_frame_set_ver_stride(mpp_frame, enc.ver_stride);
             ffi::mpp_frame_set_fmt(mpp_frame, ffi::MPP_FMT_YUV420SP);
-            // set_buffer inc_refs the buffer; we keep our ref since we reuse it
-            ffi::mpp_frame_set_buffer(mpp_frame, enc.input_buf);
+            ffi::mpp_frame_set_buffer(mpp_frame, enc.input_bufs[enc.buf_index]);
             ffi::mpp_frame_set_eos(mpp_frame, 0);
 
             if let Some(p) = frame.pts() {
                 ffi::mpp_frame_set_pts(mpp_frame, p.nseconds() as i64);
             }
 
-            // Submit frame to MPP
             let put_frame = (*enc.mpi).encode_put_frame.ok_or_else(|| {
                 ffi::mpp_frame_deinit(&mut mpp_frame);
                 gst::FlowError::Error
@@ -449,61 +467,63 @@ impl VideoEncoderImpl for MppH265Enc {
                 return Err(gst::FlowError::Error);
             }
 
-            // Poll for encoded packet (synchronous — blocks until packet is ready)
-            let get_packet = (*enc.mpi).encode_get_packet.ok_or(gst::FlowError::Error)?;
-            let mut pkt: ffi::MppPacket = std::ptr::null_mut();
-
-            for _ in 0..MAX_POLL_ATTEMPTS {
-                get_packet(enc.mpp_ctx, &mut pkt);
-                if !pkt.is_null() {
-                    break;
-                }
-                // encode_get_packet blocks up to 100ms (MPP_SET_OUTPUT_TIMEOUT),
-                // so no explicit sleep needed between attempts.
-            }
-
-            // Release the MppFrame now that encoding is done.
-            // mpp_frame_deinit releases the buffer ref that mpp_frame_set_buffer added.
-            ffi::mpp_frame_deinit(&mut mpp_frame);
-
-            if pkt.is_null() {
-                gst::error!(CAT, imp = self, "encode_get_packet timed out");
-                return Err(gst::FlowError::Error);
-            }
-
-            let pkt_buf = ffi::mpp_packet_get_buffer(pkt);
-            let pkt_len = ffi::mpp_packet_get_length(pkt);
-
-            // Memcpy encoded packet to GstBuffer. Encoded H.265 packets are small
-            // (~36KB), so memcpy is negligible. DMA-BUF zero-copy for output is
-            // problematic due to MPP output pool refcount semantics.
-            if !pkt_buf.is_null() && pkt_len > 0 {
-                let pkt_ptr = ffi::mpp_buffer_get_ptr(pkt_buf) as *const u8;
-                let src = std::slice::from_raw_parts(pkt_ptr, pkt_len);
-                let mut buf = gst::Buffer::with_size(pkt_len).unwrap();
-                {
-                    let buf_mut = buf.get_mut().unwrap();
-                    let mut map = buf_mut.map_writable().unwrap();
-                    map.as_mut_slice().copy_from_slice(src);
-                }
-                frame.set_output_buffer(buf);
-            }
-
-            ffi::mpp_packet_deinit(&mut pkt);
+            // Track in-flight frame for deinit when its packet arrives
+            enc.in_flight_frame = mpp_frame;
+            // Alternate ping-pong buffer for next frame
+            enc.buf_index ^= 1;
         }
 
-        // Release enc_state lock before finish_frame
+        // 4) Drop frame ref (stays in encoder's pending list for later finish_frame)
+        //    and release state lock before finishing the PREVIOUS frame
+        drop(frame);
         drop(enc_state);
 
-        gst_video::prelude::VideoEncoderExt::finish_frame(&*self.obj(), frame)
+        // 5) Finish the previous frame (if any) now that we've released the state lock
+        if let Some(prev_buf) = prev_result {
+            let obj = self.obj();
+            let mut prev_frame: gst_video::VideoCodecFrame = gst_video::prelude::VideoEncoderExtManual::oldest_frame(&*obj).ok_or(gst::FlowError::Error)?;
+            prev_frame.set_output_buffer(prev_buf);
+            return gst_video::prelude::VideoEncoderExt::finish_frame(&*obj, prev_frame);
+        }
+
+        Ok(gst::FlowSuccess::Ok)
+    }
+
+    fn finish(&self) -> Result<gst::FlowSuccess, gst::FlowError> {
+        gst::debug!(CAT, imp = self, "finish: draining last frame");
+        let mut enc_state = self.state.lock().unwrap();
+        let enc = match enc_state.as_mut() {
+            Some(e) => e,
+            None => return Ok(gst::FlowSuccess::Ok),
+        };
+
+        if enc.in_flight_frame.is_null() {
+            return Ok(gst::FlowSuccess::Ok);
+        }
+
+        let buf = self.poll_and_finish_pending(enc)?;
+        drop(enc_state);
+
+        let obj = self.obj();
+        let mut last_frame: gst_video::VideoCodecFrame = match gst_video::prelude::VideoEncoderExtManual::oldest_frame(&*obj) {
+            Some(f) => f,
+            None => return Ok(gst::FlowSuccess::Ok),
+        };
+        last_frame.set_output_buffer(buf);
+        gst_video::prelude::VideoEncoderExt::finish_frame(&*obj, last_frame)
     }
 
     fn flush(&self) -> bool {
         gst::debug!(CAT, imp = self, "flush");
 
-        let guard = self.state.lock().unwrap();
-        if let Some(ref enc) = *guard {
+        let mut guard = self.state.lock().unwrap();
+        if let Some(ref mut enc) = *guard {
             unsafe {
+                // Release any in-flight frame
+                if !enc.in_flight_frame.is_null() {
+                    ffi::mpp_frame_deinit(&mut enc.in_flight_frame);
+                    enc.in_flight_frame = std::ptr::null_mut();
+                }
                 if let Some(reset) = (*enc.mpi).reset {
                     reset(enc.mpp_ctx);
                 }
@@ -523,6 +543,54 @@ impl VideoEncoderImpl for MppH265Enc {
 }
 
 impl MppH265Enc {
+    /// Poll for the encoded packet of the in-flight frame.
+    /// Deinits the in-flight MppFrame and returns the output GstBuffer.
+    fn poll_and_finish_pending(
+        &self,
+        enc: &mut EncoderState,
+    ) -> Result<gst::Buffer, gst::FlowError> {
+        unsafe {
+            let get_packet = (*enc.mpi).encode_get_packet.ok_or(gst::FlowError::Error)?;
+            let mut pkt: ffi::MppPacket = std::ptr::null_mut();
+
+            for _ in 0..MAX_POLL_ATTEMPTS {
+                get_packet(enc.mpp_ctx, &mut pkt);
+                if !pkt.is_null() {
+                    break;
+                }
+            }
+
+            // Release the in-flight MppFrame (releases buffer ref from set_buffer)
+            ffi::mpp_frame_deinit(&mut enc.in_flight_frame);
+            enc.in_flight_frame = std::ptr::null_mut();
+
+            if pkt.is_null() {
+                gst::error!(CAT, imp = self, "encode_get_packet timed out");
+                return Err(gst::FlowError::Error);
+            }
+
+            let pkt_buf = ffi::mpp_packet_get_buffer(pkt);
+            let pkt_len = ffi::mpp_packet_get_length(pkt);
+
+            let buf = if !pkt_buf.is_null() && pkt_len > 0 {
+                let pkt_ptr = ffi::mpp_buffer_get_ptr(pkt_buf) as *const u8;
+                let src = std::slice::from_raw_parts(pkt_ptr, pkt_len);
+                let mut buf = gst::Buffer::with_size(pkt_len).unwrap();
+                {
+                    let buf_mut = buf.get_mut().unwrap();
+                    let mut map = buf_mut.map_writable().unwrap();
+                    map.as_mut_slice().copy_from_slice(src);
+                }
+                buf
+            } else {
+                gst::Buffer::new()
+            };
+
+            ffi::mpp_packet_deinit(&mut pkt);
+            Ok(buf)
+        }
+    }
+
     fn copy_input_to_mpp(
         &self,
         enc: &EncoderState,
@@ -531,23 +599,22 @@ impl MppH265Enc {
         let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
         let input_data = map.as_slice();
 
-        let hor_stride = enc.hor_stride;
-        let ver_stride = enc.ver_stride;
-        let frame_size = (hor_stride * ver_stride * 3 / 2) as usize;
+        let width = enc.width as usize;
+        let height = enc.height as usize;
+        let dst_stride = enc.hor_stride as usize;
+        let dst_vstride = enc.ver_stride as usize;
 
         unsafe {
-            // Reuse pre-allocated input buffer (allocated once in set_format)
-            let mpp_buf = enc.input_buf;
+            let mpp_buf = enc.input_bufs[enc.buf_index];
             let dst_ptr = ffi::mpp_buffer_get_ptr(mpp_buf) as *mut u8;
-            let width = enc.width as usize;
-            let height = enc.height as usize;
-            let dst_stride = hor_stride as usize;
 
+            // Copy Y plane (row by row if stride differs, bulk if same)
             if width == dst_stride {
-                let copy_size = frame_size.min(input_data.len());
-                std::ptr::copy_nonoverlapping(input_data.as_ptr(), dst_ptr, copy_size);
+                let y_copy = width * height;
+                if y_copy <= input_data.len() {
+                    std::ptr::copy_nonoverlapping(input_data.as_ptr(), dst_ptr, y_copy);
+                }
             } else {
-                // Copy Y plane
                 for y in 0..height {
                     let src_off = y * width;
                     let dst_off = y * dst_stride;
@@ -559,10 +626,31 @@ impl MppH265Enc {
                         );
                     }
                 }
-                // Copy UV plane
-                let src_uv = height * width;
-                let dst_uv = ver_stride as usize * dst_stride;
-                for y in 0..height / 2 {
+            }
+
+            // Zero Y padding rows (height..ver_stride)
+            if dst_vstride > height {
+                let pad_start = height * dst_stride;
+                let pad_end = dst_vstride * dst_stride;
+                std::ptr::write_bytes(dst_ptr.add(pad_start), 0u8, pad_end - pad_start);
+            }
+
+            // Copy UV plane to correct offset (ver_stride * hor_stride)
+            let src_uv = height * width;
+            let dst_uv = dst_vstride * dst_stride;
+            let uv_height = height / 2;
+
+            if width == dst_stride {
+                let uv_copy = width * uv_height;
+                if src_uv + uv_copy <= input_data.len() {
+                    std::ptr::copy_nonoverlapping(
+                        input_data.as_ptr().add(src_uv),
+                        dst_ptr.add(dst_uv),
+                        uv_copy,
+                    );
+                }
+            } else {
+                for y in 0..uv_height {
                     let src_off = src_uv + y * width;
                     let dst_off = dst_uv + y * dst_stride;
                     if src_off + width <= input_data.len() {
@@ -573,6 +661,13 @@ impl MppH265Enc {
                         );
                     }
                 }
+            }
+
+            // Fill UV padding rows with 128 (neutral chroma = gray, not green)
+            if dst_vstride / 2 > uv_height {
+                let uv_pad_start = dst_uv + uv_height * dst_stride;
+                let uv_pad_end = dst_uv + (dst_vstride / 2) * dst_stride;
+                std::ptr::write_bytes(dst_ptr.add(uv_pad_start), 128u8, uv_pad_end - uv_pad_start);
             }
 
             Ok(())
