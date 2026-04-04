@@ -22,6 +22,7 @@ pub type MppBuffer = *mut c_void;
 pub type MppBufferGroup = *mut c_void;
 pub type MppEncCfg = *mut c_void;
 pub type MppMeta = *mut c_void;
+pub type MppTask = *mut c_void;
 pub type MppParam = *mut c_void;
 pub type MppRet = c_int;
 
@@ -219,11 +220,21 @@ pub const MPP_ENC_SEI_MODE_DISABLE: c_int = 0;
 
 pub const MPP_POLL_NON_BLOCK: c_int = 0; // MPP_POLL_NON_BLOCK in mpp_task.h
 
-//  
-// Meta keys (for mpp_meta_get_frame etc.)
-//  
+//
+// Meta keys — FOURCC_META values from mpp_meta.h
+//
 
-pub const KEY_INPUT_FRAME: c_int = 3; // From mpp_meta.h enum
+pub const KEY_INPUT_FRAME: c_int = 0x6966_726d; // FOURCC_META('i','f','r','m')
+pub const KEY_INPUT_PACKET: c_int = 0x6970_6b74; // FOURCC_META('i','p','k','t')
+pub const KEY_OUTPUT_FRAME: c_int = 0x6f66_726d; // FOURCC_META('o','f','r','m')
+
+//
+// Task port types (MppPortType) and poll types
+//
+
+pub const MPP_PORT_INPUT: c_int = 0;
+pub const MPP_PORT_OUTPUT: c_int = 1;
+pub const MPP_POLL_BLOCK: c_int = -1;
 
 //  
 // Alignment
@@ -275,10 +286,12 @@ extern "C" {
 
     // ---- Packet operations ----
     pub fn mpp_packet_init(pkt: *mut MppPacket, data: *const c_void, size: usize) -> MppRet;
+    pub fn mpp_packet_init_with_buffer(pkt: *mut MppPacket, buf: MppBuffer) -> MppRet;
     pub fn mpp_packet_deinit(pkt: *mut MppPacket) -> MppRet;
     pub fn mpp_packet_set_pts(pkt: MppPacket, pts: i64);
     pub fn mpp_packet_set_eos(pkt: MppPacket);
     pub fn mpp_packet_set_extra_data(pkt: MppPacket);
+    pub fn mpp_packet_set_length(pkt: MppPacket, size: usize);
     pub fn mpp_packet_get_length(pkt: MppPacket) -> usize;
     pub fn mpp_packet_get_buffer(pkt: MppPacket) -> MppBuffer;
     pub fn mpp_packet_get_meta(pkt: MppPacket) -> MppMeta;
@@ -332,6 +345,15 @@ extern "C" {
 
     // ---- Meta operations ----
     pub fn mpp_meta_get_frame(meta: MppMeta, key: c_int, frame: *mut MppFrame) -> MppRet;
+    pub fn mpp_meta_set_frame(meta: MppMeta, key: c_int, frame: MppFrame) -> MppRet;
+    pub fn mpp_meta_set_packet(meta: MppMeta, key: c_int, packet: MppPacket) -> MppRet;
+    pub fn mpp_meta_get_packet(meta: MppMeta, key: c_int, packet: *mut MppPacket) -> MppRet;
+    pub fn mpp_frame_get_meta(frame: MppFrame) -> MppMeta;
+
+    // ---- Task meta operations ----
+    pub fn mpp_task_meta_set_packet(task: MppTask, key: c_int, packet: MppPacket) -> MppRet;
+    pub fn mpp_task_meta_set_frame(task: MppTask, key: c_int, frame: MppFrame) -> MppRet;
+    pub fn mpp_task_meta_get_frame(task: MppTask, key: c_int, frame: *mut MppFrame) -> MppRet;
 }
 
 // GStreamer DmaBuf allocator FFI (from libgstallocators-1.0)

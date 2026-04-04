@@ -3,12 +3,14 @@ mod allocator;
 
 mod enc;
 mod dec;
+mod jpegdec;
 
 use gstreamer as gst;
 
 fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
     enc::register(plugin)?;
     dec::register(plugin)?;
+    jpegdec::register(plugin)?;
     Ok(())
 }
 
